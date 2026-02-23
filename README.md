@@ -1,7 +1,7 @@
 
 ## Interactive U-Net
 
-A segmentation tool that utilizes the U-Net deep learning architecture to quickly and efficiently segment 3D volumetric images. It utilizes the Zarr storage format to enable the segmentation of extremely large images (tested with large scans over 250GB per volume). 
+A segmentation tool that utilizes the U-Net deep learning architecture to quickly and efficiently segment 3D volumetric images. It utilizes the Zarr storage format to enable the segmentation of extremely large images.
 
 ### Installation:
 

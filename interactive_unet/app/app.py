@@ -11,8 +11,9 @@ class InteractiveSegmentationApp:
         self.state = AppState.from_project(args.project_folder)
         self.services = AppServices(self.state)
 
-        if args.num_classes is not None:
-            self.state.train.num_classes = args.num_classes
+        self.state.train.num_classes = args.num_classes
+        self.state.train.architecture = args.model
+        self.state.train.encoder_name = args.encoder
 
         loop = asyncio.get_event_loop()
         self.scheduler = JobScheduler(loop=loop)

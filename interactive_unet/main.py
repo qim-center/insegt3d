@@ -22,9 +22,43 @@ def main():
     parser.add_argument(
         '--num_classes',
         type=int,
+        default=2,
         choices=range(2, 11),
-        required=True,
         help='Number of classes (must be between 2 and 10)'
+    )
+    parser.add_argument(
+        '--model',
+        type=str,
+        default='U-Net',
+        choices=[
+            "U-Net",
+            "U-Net++",
+            "FPN",
+            "PSPNet",
+            "DeepLabV3",
+            "DeepLabV3+",
+            "LinkNet",
+            "MA-Net",
+            "PAN",
+            "UPerNet",
+            "Segformer",
+        ],
+        help=(
+            "Segmentation model architecture. One of: "
+            "U-Net, U-Net++, FPN, PSPNet, DeepLabV3, "
+            "DeepLabV3+, LinkNet, MA-Net, PAN, UPerNet, Segformer. "
+        )
+    )
+    parser.add_argument(
+        '--encoder',
+        type=str,
+        default='resnet34',
+        help=(
+            "Encoder backbone architecture. "
+            "See https://smp.readthedocs.io/en/latest/encoders.html "
+            "and https://smp.readthedocs.io/en/latest/encoders_timm.html "
+            "for available options."
+        )
     )
     args = parser.parse_args()
 

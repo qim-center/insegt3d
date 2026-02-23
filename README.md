@@ -47,7 +47,7 @@ The tool expects data to be stored in multi-scale Zarr files with a 'uint8' data
 `pip install git+https://github.com/laprade117/interactive-unet`
 
 4. Launch the tool:
-`interactive-unet`
+`interactive-unet --project_folder "path/to/project_folder" --num_classes 2`
 
 ### DTU Thinlinc Setup (with Conda)
 
@@ -64,9 +64,6 @@ The tool expects data to be stored in multi-scale Zarr files with a 'uint8' data
 `pip install git+https://github.com/laprade117/interactive-unet`
 
 5. Launch the tool:
-`interactive-unet`
+`interactive-unet --project_folder "path/to/project_folder" --num_classes 2`
 
-6. If `interactive-unet` doesn't produce a working NiceGUI interface, an alternative is to just clone the repo and run
-`python interactive_unet/app.py`
-
-While running on Thinlinc, you can only access the tool from the browser within the the ThinLinc Client. Access outside of the ThinLinc client is not working yet.
+While running on Thinlinc, you can only access the tool from the browser within the the ThinLinc Client. Access outside of the ThinLinc client is not working.

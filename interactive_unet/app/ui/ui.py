@@ -81,7 +81,7 @@ class UIBuilder():
                 
                 self.input_path = ui.input(
                     label='Path to data',
-                    value='/home/billy/Desktop/interactive-unet/data',
+                    value='path/to/zarr/files',
                 ).classes('w-full')
                 self.button_load = ui.button('Load', on_click=self.callbacks.load_zarr_files).classes('w-full')
                 self.select_scan = ui.select({0: 'None'}, label='Scan', with_input=True, value=0, on_change=self.callbacks.select_scan).classes('w-full')

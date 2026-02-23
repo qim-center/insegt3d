@@ -15,7 +15,7 @@ After installation you can run the tool using:
 
 This will create a project folder at the specified location then setup a user interface for a two-class segmentation task and provide a link that can be opened in any web browser. If you wish to segment more than two classes, increase the `--num_classes` argument to a large value (maximum 10). A random port is used when creating the interface, however, it can be specified with `--port 9090`, if needed.
 
-The tool expects data to be stored in multi-scale Zarr files with a 'uint8' datatype. Chunk sizes of 32x32x32 or 64x64x64 have been found to be optimal for efficient navigation with the tool. See the Converting_to_zarr.ipynb notebook for some scripts for converting to the correct formats.
+The tool expects data to be stored in multi-scale Zarr files with a 'uint8' datatype. Chunk sizes of 32x32x32 or 64x64x64 have been found to be optimal for efficient navigation with the tool. See the `Converting_to_zarr.ipynb` notebook for some scripts for converting to the correct formats.
 
 ### Keyboard Shortcuts
 

@@ -4,11 +4,28 @@ from nicegui import ui
 from interactive_unet.app import InteractiveSegmentationApp
 
 def main():
-    parser = argparse.ArgumentParser(description='Interactive U-Net Segmentation Tool')
-    parser.add_argument('--project_folder', type=str, default=None, help='Location to store masks, predictions, model checkpoints, etc.')
-    parser.add_argument('--port', type=int, default=None, help='Port to run the application on')
-    parser.add_argument('--num_classes', type=int, default=None, help='Port to run the application on')
-
+    parser = argparse.ArgumentParser(
+        description='Interactive U-Net Segmentation Tool'
+    )
+    parser.add_argument(
+        '--project_folder',
+        type=str,
+        default=None,
+        help='Location to store masks, predictions, model checkpoints, etc.'
+    )
+    parser.add_argument(
+        '--port',
+        type=int,
+        default=None,
+        help='Port to run the application on'
+    )
+    parser.add_argument(
+        '--num_classes',
+        type=int,
+        choices=range(2, 11),
+        required=True,
+        help='Number of classes (must be between 2 and 10)'
+    )
     args = parser.parse_args()
 
     # Use provided port or fall back to a random port between 20000-40000

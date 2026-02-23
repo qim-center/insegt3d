@@ -1,52 +1,44 @@
 
 ## Interactive U-Net
 
-A segmentation tool that utilizes the U-Net deep learning architecture to quickly and efficiently segment 3D volumetric images.
+A segmentation tool that utilizes the U-Net deep learning architecture to quickly and efficiently segment 3D volumetric images. It utilizes the Zarr storage format to enable the segmentation of extremely large images (tested with large scans over 250GB per volume). 
 
 ### Installation:
 
 `pip install git+https://github.com/laprade117/interactive-unet`
 
-
 ### Usage
 
-Run the tool in a designated project folder using:
+After installation you can run the tool using:
 
-`interactive-unet`
+`interactive-unet --project_folder "path/to/project_folder" --num_classes 2` 
 
-This will create the necessary folder structure at the current working directory and then provide a link that can be opened in any web browser to access the interface. On first run, the tool will automatically download a sample volume to get started.
+This will create a project folder at the specified location then setup a user interface for a two-class segmentation task and provide a link that can be opened in any web browser. If you wish to segment more than two classes, increase the `--num_classes` argument to a large value (maximum 10). A random port is used when creating the interface, however, it can be specified with `--port 9090`, if needed.
 
-To work with your own data, remove the sample volume from `data/image_volumes` folder and copy any 3D volumetric images that you want to segment into the same folder. Ensure they are stored as multi-scale Zarr v3 files in `uint8` with a chunk size of 128 and a shard size of 256 (other values for chunk and shard sizes are currently untested, this is temporary reqirement that will be lifted as development continues).
-
-Using the paint tool annotate at least one image and then train a model. Repeat until desired segmentation result.
+The tool expects data to be stored in multi-scale Zarr files with a 'uint8' datatype. Chunk sizes of 32x32x32 or 64x64x64 have been found to be optimal for efficient navigation with the tool. See the Converting_to_zarr.ipynb notebook for some scripts for converting to the correct formats.
 
 ### Keyboard Shortcuts
 
 - **Left click**: Paint displayed color
-- **Right click**: Paint background color (red)
-- **Ctrl + Left Click**: Push displayed overlay onto annotation map
+- **Shift + Left Click**: Push displayed overlay onto annotation map
 
 - **Mouse Wheel**: Adjust brush size
-- **Ctrl + S**: Save sample
-
-- **Q**: Next slice in stack
-- **A**: Previous slice in stack
-- **Spacebar**: Random slice
   
-- **C**: Cycles through additional colors if using more than two classes.
+- **C**: Cycles through colors
 - **D**: Toggle prediction overlay
-- **F**: Cycle between overlay types
   
 - **Ctrl + Z**: Undo last paint stroke
 - **Ctrl + Y**: Redo last paint stroke
   
-- **Shift + Left Click + Drag**: Drag image
-- **Shift + Mouse Wheel**: Zoom in and out
+- **Ctrl + Left Click + Drag**: Translation
+- **Ctrl + Mouse Wheel**: Zoom in and out
+- **Ctrl + Right Click + Drag**: Scroll through slices
+- **Ctrl + Middle Mouse Button + Drag**: Rotate plane
 
 ### Local Setup (with Conda)
 
 1. Create a conda environment:
-`conda create --name unet python=3.12`
+`conda create --name unet python=3.11`
 
 2. Activate the environment:
 `conda activate unet`
@@ -57,16 +49,13 @@ Using the paint tool annotate at least one image and then train a model. Repeat 
 4. Launch the tool:
 `interactive-unet`
 
-5. If the `interactive-unet` command doesn't produce a working NiceGUI interface, an alternative is to just clone the repo and run
-`python interactive_unet/app.py`
-
 ### DTU Thinlinc Setup (with Conda)
 
 1. Activate an interactive GPU session:
 `sxm2sh -X`
 
 2. Create a conda environment:
-`conda create --name unet python=3.12`
+`conda create --name unet python=3.11`
 
 3. Activate the environment:
 `conda activate unet`

@@ -5,7 +5,7 @@ A segmentation tool that utilizes the U-Net deep learning architecture to quickl
 
 ### Installation:
 
-`pip install git+https://github.com/laprade117/interactive-unet`
+`pip install git+https://github.com/qim-center/insegt3d`
 
 ### Usage
 
@@ -44,7 +44,7 @@ The tool expects data to be stored in multi-scale Zarr files with a 'uint8' data
 `conda activate unet`
 
 3. Install the tool:
-`pip install git+https://github.com/laprade117/interactive-unet`
+`pip install git+https://github.com/qim-center/insegt3d`
 
 4. Launch the tool:
 `interactive-unet --project_folder "path/to/project_folder" --num_classes 2`
@@ -61,7 +61,7 @@ The tool expects data to be stored in multi-scale Zarr files with a 'uint8' data
 `conda activate unet`
 
 4. Install the tool:
-`pip install git+https://github.com/laprade117/interactive-unet`
+`pip install git+https://github.com/qim-center/insegt3d`
 
 5. Launch the tool:
 `interactive-unet --project_folder "path/to/project_folder" --num_classes 2`

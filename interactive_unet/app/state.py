@@ -105,13 +105,13 @@ class ProjectionState:
 class TrainState:
     input_size: int = 512
     epochs: int = 1
-    lr: float = 1e-3
+    lr: float = 4e-3
     batch_size: int = 4
     num_classes: int = 2
-    architecture: str = 'U-Net'
-    encoder_name: str = 'resnet34'
+    architecture: str = 'U-Net++'
+    encoder_name: str = 'resnet50'
     pretrained: bool = True
-    recency_temp: float = 50.0
+    recency_temp: float = 250.0
     steps_per_epoch: int = 20
     ema_decay: float = 0.9
     loss_fn: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor] = metrics.mcc_ce_loss

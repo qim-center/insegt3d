@@ -2,7 +2,7 @@ import asyncio
 
 from insegt3d.app import AppState, AppServices, UIBuilder, JobScheduler, ViewportRenderer, CallbackManager, InputHandler
 
-from insegt3d.tools import NavigatorTool, AnnotatorTool, FloodFillTool, LiveTrainerTool
+from insegt3d.tools import NavigatorTool, AnnotatorTool, FloodFillTool, MaskFillTool, LiveTrainerTool
 
 class InteractiveSegmentationApp:
     
@@ -26,6 +26,7 @@ class InteractiveSegmentationApp:
             NavigatorTool(self.state, self.services, self.renderer, self.scheduler, self.callbacks),
             AnnotatorTool(self.state, self.services, self.renderer, self.scheduler, self.callbacks),
             FloodFillTool(self.state, self.services, self.renderer, self.scheduler, self.callbacks),
+            MaskFillTool(self.state, self.services, self.renderer, self.scheduler, self.callbacks),
             LiveTrainerTool(self.state, self.services, self.renderer, self.scheduler, self.callbacks)
             ]
         

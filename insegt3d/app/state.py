@@ -38,7 +38,7 @@ class NavigationState:
 @dataclass
 class AnnotationState:
     annotating: bool = False
-    mode: str = 'draw' # Interaction mode: None | "draw" | "save" | "flood"
+    mode: str = 'draw' # Interaction mode: None | "draw" | "save" | "flood" | "mask_fill"
     brush_size: int = 3
     colors: List[str] = field(default_factory=lambda: [
         'rgba(230, 25, 75, 1)', 'rgba(60, 180, 75, 1)',

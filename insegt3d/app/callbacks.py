@@ -167,20 +167,26 @@ class CallbackManager:
         self._request_slice_update()
 
     def toggle_annotation_mode(self):
+        self.annot.annotating = False
         if self.ui.toggle_annotation_mode.value == 0:
             self.annot.mode = 'draw'
         if self.ui.toggle_annotation_mode.value == 1:
             self.annot.mode = 'save'
         if self.ui.toggle_annotation_mode.value == 2:
             self.annot.mode = 'flood'
+        if self.ui.toggle_annotation_mode.value == 3:
+            self.annot.mode = 'mask_fill'
 
     def set_annotation_mode(self):
+        self.annot.annotating = False
         if self.annot.mode == 'draw':
             self.ui.toggle_annotation_mode.value = 0
         if self.annot.mode == 'save':
             self.ui.toggle_annotation_mode.value = 1
         if self.annot.mode == 'flood':
             self.ui.toggle_annotation_mode.value = 2
+        if self.annot.mode == 'mask_fill':
+            self.ui.toggle_annotation_mode.value = 3
     
     def update_brush_size(self, i):
         self.annot.brush_size = self.ui.slider_brush_size.value

@@ -108,7 +108,7 @@ class UIBuilder():
                 with ui.row().classes('w-full items-center gap-2'):
                     ui.label('Mode').classes('text-s text-gray-600 w-16 shrink-0')
                     self.toggle_annotation_mode = ui.toggle(
-                        {0: 'Draw', 1: 'Overlay', 2: 'Flood'},
+                        {0: 'Draw', 1: 'Overlay', 2: 'Flood', 3: 'Fill'},
                         value=0,
                         on_change=self.callbacks.toggle_annotation_mode
                     ).props('dense spread').classes('flex-1')

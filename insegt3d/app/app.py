@@ -1,8 +1,8 @@
 import asyncio
 
-from interactive_unet.app import AppState, AppServices, UIBuilder, JobScheduler, ViewportRenderer, CallbackManager, InputHandler
+from insegt3d.app import AppState, AppServices, UIBuilder, JobScheduler, ViewportRenderer, CallbackManager, InputHandler
 
-from interactive_unet.tools import NavigatorTool, AnnotatorTool, FloodFillTool, LiveTrainerTool
+from insegt3d.tools import NavigatorTool, AnnotatorTool, FloodFillTool, LiveTrainerTool
 
 class InteractiveSegmentationApp:
     

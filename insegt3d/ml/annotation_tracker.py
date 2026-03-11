@@ -4,7 +4,7 @@ import numpy as np
 from pathlib import Path
 from dataclasses import dataclass
 
-from interactive_unet.volume.camera import Camera
+from insegt3d.volume.camera import Camera
 
 @dataclass
 class Annotation:

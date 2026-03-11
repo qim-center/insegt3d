@@ -1,7 +1,7 @@
 import numpy as np
 from nicegui import ui
 from concurrent.futures import ThreadPoolExecutor
-from interactive_unet.app.scheduler import JobSpec
+from insegt3d.app.scheduler import JobSpec
 
 EPS = 1e-9
 PI = np.pi

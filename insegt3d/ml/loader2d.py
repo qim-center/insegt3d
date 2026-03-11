@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, Sampler
 
-from interactive_unet.volume.slicer import VolumeSlicer
+from insegt3d.volume.slicer import VolumeSlicer
 
 class LiveTrainingDataset(Dataset):
     """

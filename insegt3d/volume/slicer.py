@@ -2,8 +2,8 @@ import cv2
 import numpy as np
 import threading
 
-from interactive_unet.volume.io import read_multiscale_zarr
-from interactive_unet.volume.interp import write_nearest, read_nearest, read_trilinear
+from insegt3d.volume.io import read_multiscale_zarr
+from insegt3d.volume.interp import write_nearest, read_nearest, read_trilinear
 
 class VolumeSlicer(object):
 

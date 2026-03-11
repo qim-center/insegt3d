@@ -5,7 +5,7 @@ from urllib.parse import urlparse
 
 from pathlib import Path
 
-from interactive_unet.ml import predict2d as predict
+from insegt3d.ml import predict2d as predict
 
 def _is_http_url(s: str) -> bool:
     p = urlparse(s.strip())

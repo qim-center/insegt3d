@@ -1,7 +1,7 @@
 import argparse
 import numpy as np
 from nicegui import ui
-from interactive_unet.app import InteractiveSegmentationApp
+from insegt3d.app import InteractiveSegmentationApp
 
 def main():
     parser = argparse.ArgumentParser(

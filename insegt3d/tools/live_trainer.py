@@ -8,11 +8,11 @@ from torchvision.transforms import v2
 
 from concurrent.futures import ThreadPoolExecutor
 
-from interactive_unet.app.scheduler import JobSpec
-from interactive_unet.tools.base_tool import BaseTool
+from insegt3d.app.scheduler import JobSpec
+from insegt3d.tools.base_tool import BaseTool
 
-from interactive_unet.ml.loader2d import build_dataloader
-from interactive_unet.ml.unet2d import UNet2D
+from insegt3d.ml.loader2d import build_dataloader
+from insegt3d.ml.unet2d import UNet2D
 
 
 class LiveTrainerTool(BaseTool):

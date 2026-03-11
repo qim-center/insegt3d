@@ -1,8 +1,8 @@
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 
-from interactive_unet.app.scheduler import JobSpec
-from interactive_unet.tools.base_tool import BaseTool
+from insegt3d.app.scheduler import JobSpec
+from insegt3d.tools.base_tool import BaseTool
 
 class NavigatorTool(BaseTool):
 

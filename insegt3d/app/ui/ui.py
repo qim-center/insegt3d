@@ -1,6 +1,6 @@
 from nicegui import ui
 
-from interactive_unet.app.ui.navigator import NavigatorWidget
+from insegt3d.app.ui.navigator import NavigatorWidget
 
 class UIBuilder():
 

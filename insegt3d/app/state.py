@@ -4,10 +4,10 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from typing import List, Callable, Optional
 
-from interactive_unet.volume.slicer import VolumeSlicer
-from interactive_unet.volume.camera import Camera
-from interactive_unet.ml.annotation_tracker import AnnotationTracker
-from interactive_unet.ml import metrics
+from insegt3d.volume.slicer import VolumeSlicer
+from insegt3d.volume.camera import Camera
+from insegt3d.ml.annotation_tracker import AnnotationTracker
+from insegt3d.ml import metrics
 
 
 # ------------------------- State (values only) -------------------------

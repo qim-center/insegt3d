@@ -3,8 +3,8 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "interactive-unet"
-version = "0.2.0"
+name = "insegt3d"
+version = "0.2.1"
 description = "An interactive segmentation tool for 3D volumetric data."
 license = { text = "BSD-2-Clause" }
 requires-python = ">=3.11"
@@ -26,7 +26,7 @@ dependencies = [
 ]
 
 [project.scripts]
-interactive-unet = "interactive_unet.main:main"
+insegt3d = "insegt3d.main:main"
 
 [tool.setuptools.packages.find]
-include = ["interactive_unet*"]
+include = ["insegt3d*"]

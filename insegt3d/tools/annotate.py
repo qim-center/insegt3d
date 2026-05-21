@@ -147,6 +147,10 @@ class AnnotatorTool(BaseTool):
         return f'<g opacity="{opacity}">{stroke}</g>{cursor}'
 
     def _do_write_mask(self, mask):
+
+        if mask is None:
+            return
+            
         camera = self.state.camera
         h, w = self.nav.slice_shape
         half_h = h // 2

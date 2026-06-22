@@ -216,7 +216,7 @@ class CallbackManager:
         self.ui.label_rotation_v.text = (f'{fmt(v)}')
         self.ui.label_rotation_w.text = (f'{fmt(w)}')
         self.ui.label_zoom.text = f'{zoom:.02f}'
-        self.ui.label_shape.text = f'z: {volume_shape[0]}, y: {volume_shape[0]}, x: {volume_shape[0]}'
+        self.ui.label_shape.text = f'z: {volume_shape[0]}, y: {volume_shape[1]}, x: {volume_shape[2]}'
 
     def predict_volumes(self):
         predict.predict_all_volumes(self.data.zarr_files, self.data.project_path, num_classes=self.train.num_classes)

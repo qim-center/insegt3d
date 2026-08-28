@@ -74,10 +74,10 @@ data, axis order, and converting volumes larger than RAM.
 | **Left Click + Drag** | Paint with the selected class |
 | **Shift + Left Click** | Push the displayed prediction overlay into the annotation map |
 | **Mouse Wheel** | Adjust brush size |
-| <kbd>C</kbd> / <kbd>X</kbd> | Next / previous class colour |
-| <kbd>D</kbd> | Toggle the live prediction overlay |
-| <kbd>Ctrl</kbd> + <kbd>Z</kbd> | Undo last stroke |
-| <kbd>Ctrl</kbd> + <kbd>Y</kbd> | Redo last stroke |
+| C / X | Next / previous class colour |
+| D | Toggle the live prediction overlay |
+| Ctrl + Z | Undo last stroke |
+| Ctrl + Y | Redo last stroke |
 
 ### Navigating
 
@@ -87,7 +87,7 @@ data, axis order, and converting volumes larger than RAM.
 | **Ctrl + Right Click + Drag** | Scroll through slices |
 | **Ctrl + Middle Click + Drag** | Rotate the slicing plane |
 | **Ctrl + Mouse Wheel** | Zoom in and out |
-| <kbd>Space</kbd> | Randomize the orientation of the slicing plane |
+| Space | Randomize the orientation of the slicing plane |
 
 Touch input is supported as well: one finger pans, two fingers rotate and pinch-zoom.
 
@@ -97,7 +97,7 @@ The **Mode** toggle in the **Annotation** panel switches between four ways of pa
 
 - **Draw** - freehand brush strokes in the selected class.
 - **Overlay** - brush strokes accept the current prediction inside them as annotation
-  (the same thing <kbd>Shift</kbd> does temporarily while held).
+  (the same thing Shift does temporarily while held).
 - **Flood** - click a seed point and drag to grow an intensity-based flood fill; the drag
   distance sets the tolerance.
 - **Fill** - click inside a region fully enclosed by existing annotations to fill it.

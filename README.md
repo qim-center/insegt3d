@@ -150,11 +150,7 @@ Both **Also export tiff stack** in the interface and `--export-tiff` on the comm
 write a second copy of the prediction next to the zarr, as
 `<output>/predictions/<volume_name>_tiff/`. The folder holds one tiff per z slice, each
 a channel-last `(y, x, c)` image whose channels are the per-class scores - the same data
-the zarr holds, laid out so that no file is more than 3D.
-
-The stacks are written slice by slice, so exporting costs no more memory than the
-prediction itself. Note that tiff is uncompressed here: a stack takes roughly one byte per
-voxel per class.
+the zarr holds.
 
 ## Project folder layout
 

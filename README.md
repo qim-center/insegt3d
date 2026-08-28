@@ -2,7 +2,7 @@
 
 Interactive Segmentation of 3D volumes.
 
-InSegt3D is a browser-based tool for annotating and segmenting large 3D volumetric images stored in OME-ZARR format. You annotate along 2D slices through the volume while a machine learning model trains live in the background on what you have annotated, and its prediction is shown back to you as an overlay while you keep annotating.
+InSegt3D is a browser-based tool for annotating and segmenting large 3D volumetric images stored in OME-Zarr format. You annotate along 2D slices through the volume while a machine learning model trains live in the background on what you have annotated, and its prediction is shown back to you as an overlay while you keep annotating.
 
 The OME-Zarr format allows efficient and low-RAM annotation of large 3D volumes. Tested with up to 200GB OME-Zarr volumes on a laptop with 32GB RAM and an RTX A3000 GPU with 6GB VRAM.
 

@@ -1,6 +1,5 @@
 import cv2
 import numpy as np
-from concurrent.futures import ThreadPoolExecutor
 
 from insegt3d.app.scheduler import JobSpec
 from insegt3d.tools.base_tool import BaseTool
@@ -25,21 +24,25 @@ class AnnotatorTool(BaseTool):
         self.path = []
         self.svg_parts = []
 
-        self._mask_exec = ThreadPoolExecutor(max_workers=1)
-        self.scheduler.register_sync(
-            "write_mask",
-            fn=self._do_write_mask,
+        self._cursor_x = 0
+        self._cursor_y = 0
+
+        self.write_mask_job = "write_mask"
+
+        self.register_latest_job(self.write_mask_job, self._do_write_mask)
+
+        self.scheduler.register_async(
+            "update_annotation_overlay",
+            fn=self._push_overlay,
             spec=JobSpec(
                 max_hz=60,
                 mode="latest",
-                executor=self._mask_exec,
-                sequential_executor=False,
             ),
         )
 
     async def on_pointer(self, e):
 
-        if e.mouse and e.wheel:
+        if e.mouse and e.wheel and not e.ctrl:
             factor = 1.1 ** (-1 if e.delta_y > 0 else 1)
             self.annot.brush_size *= factor
             self.callbacks.set_brush_size()
@@ -47,12 +50,13 @@ class AnnotatorTool(BaseTool):
         if not e.ctrl and ((e.mouse and e.button == 0) or e.pen) and e.down:
             self.annot.annotating = True
 
-        if self.annot.annotating:
-            if self.annot.mode == 'draw':
-                self._handle_draw(e)
-            elif self.annot.mode == 'save':
-                self._handle_save(e)
+        if self.annot.annotating and self.annot.mode in ('draw', 'save'):
+            self._handle_stroke(e, saving=self.annot.mode == 'save')
 
+        self._cursor_x, self._cursor_y = e.x, e.y
+        self.scheduler.request("update_annotation_overlay")
+
+    async def _push_overlay(self):
         self.renderer.update_svg(self._get_overlay())
 
     async def on_key(self, e):
@@ -85,36 +89,24 @@ class AnnotatorTool(BaseTool):
             self.annot.next_color(self.train.num_classes)
             self.callbacks.refresh_button_palette()
 
+        if e.key == "d" and e.action.keydown:
+            self.ui.prediction.visible = not self.ui.prediction.visible
+            self.callbacks.set_prediction_overlay()
+            self.renderer.update()
+
         self.renderer.update_svg(self._get_overlay())
 
-    def _handle_draw(self, e):
+    def _handle_stroke(self, e, saving):
+        
         p = self.pointer
+        drawing = (e.mouse and e.button == 0) or e.pen
 
-        if ((e.mouse and e.button == 0) or e.pen) and e.down:
-            self._start_path(p.x, p.y, e.x, e.y)
-
-        elif (e.mouse or e.pen) and e.move:
+        if (drawing and e.down) or ((e.mouse or e.pen) and e.move):
             self._continue_path(p.x, p.y, e.x, e.y)
 
-        elif ((e.mouse and e.button == 0) or e.pen) and e.up:
-            self._end_path(saving=False)
+        elif drawing and e.up:
+            self._end_path(saving=saving)
             self.annot.annotating = False
-
-    def _handle_save(self, e):
-        p = self.pointer
-
-        if ((e.mouse and e.button == 0) or e.pen) and e.down:
-            self._start_path(p.x, p.y, e.x, e.y)
-
-        elif (e.mouse or e.pen) and e.move:
-            self._continue_path(p.x, p.y, e.x, e.y)
-
-        elif ((e.mouse and e.button == 0) or e.pen) and e.up:
-            self._end_path(saving=True)
-            self.annot.annotating = False
-
-    def _start_path(self, x0, y0, x1, y1):
-        self._continue_path(x0, y0, x1, y1)
 
     def _continue_path(self, x0, y0, x1, y1):
         a = self.annot
@@ -130,18 +122,17 @@ class AnnotatorTool(BaseTool):
 
     def _end_path(self, saving):
         mask = self._create_mask(self.path, saving=saving)
-        self.scheduler.request("write_mask", mask)
+        self.scheduler.request(self.write_mask_job, mask)
         self.path.clear()
         self.svg_parts.clear()
 
     def _get_overlay(self):
-        p = self.pointer
         a = self.annot
         opacity = self.ui.annotation.alpha
 
         stroke = "".join(self.svg_parts)
         cursor = (
-            f'<circle cx="{p.x}" cy="{p.y}" r="{a.brush_size/2}" '
+            f'<circle cx="{self._cursor_x}" cy="{self._cursor_y}" r="{a.brush_size/2}" '
             f'fill="{a.color_css}" stroke="{a.color_css}" opacity="{opacity}" />'
         )
         return f'<g opacity="{opacity}">{stroke}</g>{cursor}'
@@ -150,16 +141,14 @@ class AnnotatorTool(BaseTool):
 
         if mask is None:
             return
-            
-        camera = self.state.camera
+
         h, w = self.nav.slice_shape
-        half_h = h // 2
-        half_w = w // 2
+        half_h, half_w = h // 2, w // 2
         extent = (0, 0, -half_h, half_h, -half_w, half_w)
 
-        self.slicer.set_data(camera, mask, extent=extent)
+        self.slicer.set_data(self.camera, mask, extent=extent)
         self.tracker.on_annotation_commit(
-            self.slicer.zarr_path, camera, mask, extent
+            self.slicer.zarr_path, self.camera, mask, extent
         )
 
         self.scheduler.request("nav_hires")
@@ -174,29 +163,23 @@ class AnnotatorTool(BaseTool):
 
         mask = np.zeros((slice_h, slice_w), np.uint8)
 
-        for i, (x0, y0, x1, y1, bs, idx) in enumerate(path):
+        for i, (x0, y0, x1, y1, brush_size, color_idx) in enumerate(path):
 
             x0 = int(x0 * scale_x)
             x1 = int(x1 * scale_x)
             y0 = int(y0 * scale_y)
             y1 = int(y1 * scale_y)
 
-            scale = 1
+            radius = int(np.rint(brush_size * 0.5))
+            thickness = int(np.rint(brush_size))
+            label = color_idx + 1
 
-            r = int(np.rint(bs * scale * 0.5))
-            t = int(np.rint(bs * scale))
-            label = idx + 1
-
-            cv2.circle(mask, (x0, y0), r, label, -1)
-            cv2.line(mask, (x0, y0), (x1, y1), label, t)
+            cv2.circle(mask, (x0, y0), radius, label, -1)
+            cv2.line(mask, (x0, y0), (x1, y1), label, thickness)
             if i == len(path) - 1:
-                cv2.circle(mask, (x1, y1), r, label, -1)
+                cv2.circle(mask, (x1, y1), radius, label, -1)
 
         if saving:
-            pred = self.renderer._to_viewport_shape(
-                self.renderer.raw_prediction, resize=False
-            )
-            print(self.renderer.raw_prediction.shape, (slice_w, slice_h), mask.shape)
-            mask = (mask > 0) * pred
+            mask = (mask > 0) * self.renderer.prediction_in_viewport()
 
         return mask

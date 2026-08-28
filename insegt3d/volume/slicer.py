@@ -1,26 +1,34 @@
 import cv2
 import numpy as np
 import threading
+import tensorstore as ts
+from pathlib import Path
 
-from insegt3d.volume.io import read_multiscale_zarr
+from insegt3d.volume.io import read_multiscale_zarr, read_multiscale_masks
 from insegt3d.volume.interp import write_nearest, read_nearest, read_trilinear
+from insegt3d.volume.intensity import coarsest_small_level, native_intensity_range, robust_percentile_range
 
-class VolumeSlicer(object):
+class VolumeSlicer:
 
-    def __init__(self, max_undo=50, cache_size_mb=30000):
+    def __init__(self, max_undo=50, cache_size_mb=30000, ts_context=None):
 
         self.zarr_path = None
+        self.mask_path = None
+        self.prediction_path = None
 
         self.images = None
         self.masks = None
+        self.predictions = None
         self.shapes = None
 
-        self._level = None
+        self._intensity_range = None
 
-        # TensorStore cache settings
-        self.ts_context = {
+        self._pad_cache = {}
+
+        # TensorStore cache settings. 
+        self.ts_context = ts_context if ts_context is not None else ts.Context({
             'cache_pool': {'total_bytes_limit': int(cache_size_mb * 1024**2)}
-        }
+        })
 
         # Undo/redo (stores sparse volume patches)
         self._undo_stack = []
@@ -28,29 +36,95 @@ class VolumeSlicer(object):
         self._max_undo = max_undo
         self._edit_lock = threading.Lock()
 
-    def initialize(self, zarr_path, mask_path, camera, center_camera=False):
+    def initialize(self, zarr_path, mask_path, camera, center_camera=False, prediction_path=None):
 
         self.zarr_path = zarr_path
+        self.mask_path = mask_path
+        self.prediction_path = prediction_path
 
         # Reset undo/redo history
         self._undo_stack.clear()
         self._redo_stack.clear()
 
         # Read multiscale volume
-        self.images, self.masks = read_multiscale_zarr(
+        self.images = read_multiscale_zarr(
             self.zarr_path,
-            mask_path=mask_path,
             ts_context=self.ts_context
         )
 
         # Get shapes
         self.shapes = np.array([image.shape for image in self.images], dtype=int)
 
-        # Center camera
+        # Only open the mask arrays if a mask zarr already exists
+        if mask_path is not None and Path(mask_path).exists():
+            level_shapes = [image.shape for image in self.images]
+            self.masks = read_multiscale_masks(mask_path, level_shapes, ts_context=self.ts_context)
+        else:
+            self.masks = None
+
+        # Only open the prediction-label pyramid if this volume has already been predicted
+        if prediction_path is not None and Path(prediction_path).exists():
+            self.predictions = read_multiscale_zarr(str(prediction_path), ts_context=self.ts_context)
+        else:
+            self.predictions = None
+
         if center_camera:
             camera.reset(self.shapes[0])
 
-        self._level = 0
+        self._intensity_range = None
+
+    @property
+    def has_prediction(self):
+        return self.predictions is not None
+
+    def refresh_prediction(self, prediction_path=None):
+        """
+        (Re)loads the prediction-label pyramid without touching the image,
+        mask, or undo/redo state
+        """
+        if prediction_path is not None:
+            self.prediction_path = prediction_path
+
+        if self.prediction_path is not None and Path(self.prediction_path).exists():
+            self.predictions = read_multiscale_zarr(str(self.prediction_path), ts_context=self.ts_context)
+        else:
+            self.predictions = None
+
+    def get_intensity_range(self, max_dim=128):
+
+        if not self.images:
+            return None
+
+        if self._intensity_range is None:
+            level = coarsest_small_level(self.shapes, max_voxels=max_dim ** 3)
+            self._intensity_range = native_intensity_range(self.images[level])
+
+        return self._intensity_range
+
+    def get_robust_intensity_range(self, max_dim=128):
+        """
+        Robust intensity window (0.5th-99.5th percentile) for the currently
+        loaded volume, used as the default contrast window.
+        """
+        if not self.images:
+            return None
+
+        level = coarsest_small_level(self.shapes, max_voxels=max_dim ** 3)
+        volume = np.asarray(self.images[level])
+        return robust_percentile_range(volume)
+
+    def compute_histogram(self, max_dim=128, bins=256):
+
+        if not self.images:
+            return None, None
+
+        level = coarsest_small_level(self.shapes, max_voxels=max_dim ** 3)
+        volume = np.asarray(self.images[level])
+
+        value_range = self.get_intensity_range(max_dim=max_dim)
+        counts, _ = np.histogram(volume, bins=bins, range=value_range)
+
+        return counts, value_range
 
     def _add_to_history(self, edit):
 
@@ -104,11 +178,11 @@ class VolumeSlicer(object):
         level_modifier=0,
         scale_depth=False,
         mask=False,
+        prediction=False,
         order=0,
         axis=0,
         zoom_override=None,
         tile_hw=64,
-        rescale=False
     ):
         """
         Tiled sampler.
@@ -116,13 +190,17 @@ class VolumeSlicer(object):
         (H,W) if D==1 else (D,H,W)
         """
 
+        if self.images is None:
+            # No volume loaded yet -- nothing to sample.
+            H, W = out_shape[-2:] if out_shape else (1, 1)
+            output = np.zeros((1, H, W), dtype=np.float32)
+            return output[0]
+
         zoom = zoom_override if zoom_override is not None else camera.zoom
 
         num_levels = len(self.images)
         base_level = int(np.floor(np.log2(max(zoom, 1e-8))))
         level = int(np.clip(base_level + level_modifier, 0, num_levels - 1))
-
-        volume = self.masks[level] if mask else self.images[level]
 
         d0, d1, top, bottom, left, right = map(float, extent)
 
@@ -144,6 +222,19 @@ class VolumeSlicer(object):
         D = max(1, int(D))
         H = max(1, int(H))
         W = max(1, int(W))
+
+        if mask and self.masks is None:
+            output = np.zeros((D, H, W), dtype=np.float32)
+            return output[0] if D == 1 else output
+
+        if prediction and self.predictions is None:
+            output = np.zeros((D, H, W), dtype=np.float32)
+            return output[0] if D == 1 else output
+
+        if prediction:
+            volume = self.predictions[min(level, len(self.predictions) - 1)]
+        else:
+            volume = self.masks[level] if mask else self.images[level]
 
         s_view = zoom / (2 ** level)
 
@@ -184,9 +275,6 @@ class VolumeSlicer(object):
 
         ds_bounds = depth_samples_for_bounds()
 
-        if not hasattr(self, "_pad_cache"):
-            self._pad_cache = {} 
-
         for y0 in range(0, H, th):
             h_tile = min(th, H - y0)
             y_start = stop + y0 * dy
@@ -212,7 +300,7 @@ class VolumeSlicer(object):
 
                 pts = np.stack(corners, axis=0)
                 if not np.isfinite(pts).all():
-                    continue 
+                    continue
 
                 mn = np.floor(pts.min(axis=0)).astype(np.int64)
                 mx = (np.ceil(pts.max(axis=0)).astype(np.int64) + 1)
@@ -257,13 +345,13 @@ class VolumeSlicer(object):
                         buf = np.zeros(key, dtype=np.float32)
                         self._pad_cache[key] = buf
                     else:
-                        buf.fill(0.0) 
+                        buf.fill(0.0)
 
                     sub = np.ascontiguousarray(volume[i0:i1, j0:j1, k0:k1])
                     if sub.dtype != np.float32:
                         sub = sub.astype(np.float32, copy=False)
 
-                    oi = int(i0 - i0_raw) 
+                    oi = int(i0 - i0_raw)
                     oj = int(j0 - j0_raw)
                     ok = int(k0 - k0_raw)
                     buf[oi:oi + sub.shape[0], oj:oj + sub.shape[1], ok:ok + sub.shape[2]] = sub
@@ -289,19 +377,8 @@ class VolumeSlicer(object):
                 else:
                     raise ValueError(f"Unsupported interpolation order={order}. Use 0 or 1.")
 
-        # if rescale:
-        #    output = self._rescale_image(output)
-
         return output[0] if D == 1 else output
 
-    def _rescale_image(self, image):
-        v_min, v_max = -0.002, 0.007
-        np.clip(image, v_min, v_max, out=image)
-        image -= v_min
-        image *= 255.0 / (v_max - v_min)
-        image = image.astype(np.uint8, copy=False)
-        return image
- 
     def set_data(
         self,
         camera,
@@ -322,10 +399,17 @@ class VolumeSlicer(object):
         Writes to level 0.
         """
 
+        if self.images is None:
+            return
+
         zoom = zoom_override if zoom_override is not None else camera.zoom
         num_levels = len(self.images)
         base_level = int(np.floor(np.log2(max(float(zoom), 1e-8))))
         view_level = int(np.clip(base_level + level_modifier, 0, num_levels - 1))
+
+        if mask and self.masks is None:
+            level_shapes = [image.shape for image in self.images]
+            self.masks = read_multiscale_masks(self.mask_path, level_shapes, ts_context=self.ts_context)
 
         L = 0
         vol = self.masks[L] if mask else self.images[L]
@@ -428,9 +512,9 @@ class VolumeSlicer(object):
         ds_bounds = depth_samples_for_bounds()
 
         def _clip(i0, i1, j0, j1, k0, k1):
-            i0 = max(0, int(i0))
-            j0 = max(0, int(j0))
-            k0 = max(0, int(k0))
+            i0 = max(0, min(Is, int(i0)))
+            j0 = max(0, min(Js, int(j0)))
+            k0 = max(0, min(Ks, int(k0)))
             i1 = min(Is, int(i1))
             j1 = min(Js, int(j1))
             k1 = min(Ks, int(k1))

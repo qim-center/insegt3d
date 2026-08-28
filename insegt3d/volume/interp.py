@@ -66,8 +66,8 @@ def write_nearest(volume, data, origin, normal_axis, a0, a1, d0, dd, y0, dy, x0,
                     volume[z, y, x] = val
 
 @njit(parallel=True, fastmath=True)
-def read_nearest(volume, output, origin, normal_axis, a0, a1, d0, dd,y0, dy,x0, dx):
-                   
+def read_nearest(volume, output, origin, normal_axis, a0, a1, d0, dd, y0, dy, x0, dx):
+
     Z, Y, X = volume.shape
     D, H, W = output.shape
     zmax = Z - 1
@@ -96,8 +96,8 @@ def _linear_interpolate(a, b, t):
     return a + t * (b - a)
 
 @njit(parallel=True, fastmath=True)
-def read_trilinear(volume, output, origin, normal_axis, a0, a1,d0, dd, y0, dy, x0, dx):
-                    
+def read_trilinear(volume, output, origin, normal_axis, a0, a1, d0, dd, y0, dy, x0, dx):
+
     Z, Y, X = volume.shape
     D, H, W = output.shape
     zmax = Z - 1

@@ -1,7 +1,5 @@
 import numpy as np
-from concurrent.futures import ThreadPoolExecutor
 
-from insegt3d.app.scheduler import JobSpec
 from insegt3d.tools.base_tool import BaseTool
 
 class NavigatorTool(BaseTool):
@@ -19,30 +17,8 @@ class NavigatorTool(BaseTool):
         self.obliqueness = 0.0
 
         # Dedicated lanes (sequential per job)
-        self._low_exec = ThreadPoolExecutor(max_workers=1)
-        self._hires_exec = ThreadPoolExecutor(max_workers=1)
-
-        self.scheduler.register_sync(
-            "nav_preview",
-            fn=self._do_lowres,
-            spec=JobSpec(
-                max_hz=60,
-                mode="latest",
-                executor=self._low_exec,
-                sequential_executor=False,
-            ),
-        )
-
-        self.scheduler.register_sync(
-            "nav_hires",
-            fn=self._do_hires,
-            spec=JobSpec(
-                max_hz=10,
-                mode="latest",
-                executor=self._hires_exec,
-                sequential_executor=False,
-            ),
-        )
+        self.register_latest_job("nav_preview", self._do_preview, max_hz=60)
+        self.register_latest_job("nav_hires", self._do_hires, max_hz=10)
 
     def update_obliqueness(self, u):
         self.obliqueness = np.arccos(np.clip(np.max(np.abs(u)), -1.0, 1.0)) / np.arccos(1 / np.sqrt(3))
@@ -50,15 +26,15 @@ class NavigatorTool(BaseTool):
     async def on_pointer(self, e):
 
         s = self.state
-        ui, annot, camera, p, nav = s.ui, s.annot, s.camera, s.pointer, s.nav
-        
-        # This is because navigation feels most when calling get_data at scale=512
-        scale_factor = (min(nav.slice_shape) / 768.0)
+        ui, camera, p, nav = s.ui, s.camera, s.pointer, s.nav
+
+        # Navigation is tuned for a 768px slice; keep the feel at other sizes
+        scale_factor = min(nav.slice_shape) / 768.0
 
         dx = (p.x - e.x) * scale_factor
         dy = (p.y - e.y) * scale_factor
 
-        # Mouse navigation only when shift is held
+        # Mouse navigation only while ctrl is held
         if e.mouse and e.ctrl and not e.shift and not e.alt:
             if e.down:
                 self.panning = (e.button == 0)
@@ -81,7 +57,6 @@ class NavigatorTool(BaseTool):
             if e.wheel:
                 direction = -1 if e.delta_y < 0 else 1
                 zoom = 1.1 ** direction
-                annot.brush_size /= zoom
                 camera.zoom_by(zoom)
                 self._request_preview()
                 self._request_hires()
@@ -108,7 +83,6 @@ class NavigatorTool(BaseTool):
                         camera.rotate_axis("u", e.rotation_rad)
                         self._request_preview()
                     if self.zooming:
-                        annot.brush_size *= e.zoom_factor
                         camera.zoom_by(1 / e.zoom_factor)
                         self._request_preview()
 
@@ -140,42 +114,30 @@ class NavigatorTool(BaseTool):
         self.scheduler.request("nav_hires")
         self.scheduler.request("sync_navigator")
 
-    def _do_lowres(self):
+    def _do_preview(self):
         ui = self.state.ui
+        overlays = (ui.mask, ui.annotation, ui.prediction, ui.saved_prediction)
 
-        # Save current visibility state
-        prev_visibility = {
-            'mask': ui.mask.visible,
-            'annotation': ui.annotation.visible,
-            'prediction': ui.prediction.visible,
-        }
+        # Hide overlays while navigating, then restore them afterwards
+        was_visible = [overlay.visible for overlay in overlays]
+        for overlay in overlays:
+            overlay.visible = False
 
-        # Hide overlays while navigating
-        ui.mask.visible = False
-        ui.annotation.visible = False
-        ui.prediction.visible = False
-
-        # Choose resolution
+        # Coarser level the further the view is from an axis-aligned slice
         level_modifier = 3 if self.obliqueness > 0.3 else 2
-        image = self._extract_slice(level_modifier=level_modifier, order=1)
 
-        # Update renderer
-        self.renderer.update(image=image)
-
-        # Update display information
+        self.renderer.update(image=self._extract_slice(level_modifier=level_modifier, order=1))
         self.callbacks.update_properties()
 
-        # Restore visibility
-        ui.mask.visible = prev_visibility['mask']
-        ui.annotation.visible = prev_visibility['annotation']
-        ui.prediction.visible = prev_visibility['prediction']
+        for overlay, visible in zip(overlays, was_visible):
+            overlay.visible = visible
 
     def _do_hires(self):
-        ui = self.state.ui
 
         # Reset overlays
         self.renderer.clear_annotation()
         self.renderer.clear_prediction()
+        self.renderer.clear_saved_prediction()
 
         rev = self._local_revision
         if self._cancelled(rev):
@@ -189,13 +151,13 @@ class NavigatorTool(BaseTool):
         if self._cancelled(rev):
             return
 
-        # Show mask overlays after hires update
-        ui.mask.visible = True
+        saved_prediction = None
+        if self.services.slicer.has_prediction:
+            saved_prediction = self._extract_slice(level_modifier=0, prediction=True)
+            if self._cancelled(rev):
+                return
 
-        # Update renderer
-        self.renderer.update(image=image, mask=mask)
-
-        # Update display information
+        self.renderer.update(image=image, mask=mask, saved_prediction=saved_prediction)
         self.callbacks.update_properties()
 
         self.scheduler.request("live_predict")
@@ -215,33 +177,17 @@ class NavigatorTool(BaseTool):
 
         return (scaled_h, scaled_w)
 
-    def _extract_slice(self, level_modifier, order=0, mask=False):
-        s = self.state
-        camera, nav = s.camera, s.nav
+    def _extract_slice(self, level_modifier, order=0, mask=False, prediction=False):
+        h, w = self.state.nav.slice_shape
+        half_h, half_w = h // 2, w // 2
+        extent = (0, 0, -half_h, half_h, -half_w, half_w)
 
-        depth_start = 0
-        depth_end = 0
-
-        # if s.proj.projection is not None:
-        #     half = s.proj.depth // 2
-        #     depth_start = -half
-        #     depth_end = half + 1
-
-        h, w = nav.slice_shape
-
-        half_h = h // 2
-        half_w = w // 2
-
-        extent = (depth_start, depth_end, -half_h, half_h, -half_w, half_w)
-
-        image = self.services.slicer.get_data(
-            camera,
+        return self.services.slicer.get_data(
+            self.state.camera,
             extent=extent,
             out_shape=self._get_output_shape(level_modifier),
             level_modifier=level_modifier,
             order=order,
             mask=mask,
-            rescale=not mask
+            prediction=prediction,
         )
-
-        return image

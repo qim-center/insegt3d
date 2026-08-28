@@ -4,12 +4,11 @@ import threading
 import concurrent.futures
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional, Literal
-from collections import deque
-from functools import partial  # <-- NEW
+from functools import partial
 
 AsyncFn = Callable[..., Awaitable[None]]
 SyncFn = Callable[..., None]
-Mode = Literal["latest", "queue", "drop"]
+Mode = Literal["latest", "drop"]
 
 
 @dataclass
@@ -20,7 +19,6 @@ class JobSpec:
     idle_kwargs: Optional[dict[str, Any]] = None
 
     mode: Mode = "latest"
-    max_queue: int = 64
 
     executor: Optional[concurrent.futures.Executor] = None
     sequential_executor: bool = True
@@ -51,19 +49,23 @@ class JobScheduler:
         self.jobs[name] = Job(fn, spec, loop=self.loop, loop_thread_id=self._loop_thread_id)
 
     def register_sync(self, name: str, fn: SyncFn, *, spec: JobSpec) -> None:
-        exec_ = spec.executor
-        if exec_ is None and spec.sequential_executor:
-            exec_ = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        if exec_ is None:
-            exec_ = self._default_executor
+        executor = spec.executor
+        owned_executor = None
+        if executor is None and spec.sequential_executor:
+            executor = owned_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        if executor is None:
+            executor = self._default_executor
 
         async def wrapper(*args, **kwargs):
             loop = asyncio.get_running_loop()
             # run_in_executor does NOT accept **kwargs; bind them first
-            call = partial(fn, *args, **kwargs)
-            await loop.run_in_executor(exec_, call)
+            await loop.run_in_executor(executor, partial(fn, *args, **kwargs))
 
-        self.jobs[name] = Job(wrapper, spec, loop=self.loop, loop_thread_id=self._loop_thread_id)
+        self.jobs[name] = Job(
+            wrapper, spec,
+            loop=self.loop, loop_thread_id=self._loop_thread_id,
+            owned_executor=owned_executor,
+        )
 
     def request(self, name: str, *args, **kwargs) -> None:
         """
@@ -85,19 +87,25 @@ class JobScheduler:
     def unregister(self, name: str) -> None:
         job = self.jobs.pop(name, None)
         if job:
-            job.cancel()
+            job.shutdown()
 
     def shutdown(self) -> None:
         for job in self.jobs.values():
-            job.cancel()
+            job.shutdown()
         self._default_executor.shutdown(wait=False)
 
 
 class Job:
-    def __init__(self, fn: AsyncFn, spec: JobSpec, *, loop: asyncio.AbstractEventLoop, loop_thread_id: int):
+    def __init__(
+        self, fn: AsyncFn, spec: JobSpec, *,
+        loop: asyncio.AbstractEventLoop, loop_thread_id: int,
+        owned_executor: Optional[concurrent.futures.Executor] = None,
+    ):
         self.fn = fn
         self.loop = loop
         self._loop_thread_id = loop_thread_id
+
+        self._owned_executor = owned_executor
 
         self.mode = spec.mode
         self.min_interval = (1.0 / spec.max_hz) if spec.max_hz else 0.0
@@ -108,7 +116,6 @@ class Job:
         self.idle_gen_guard = bool(spec.idle_gen_guard)
 
         self._latest: Optional[tuple[tuple[Any, ...], dict[str, Any]]] = None
-        self._queue = deque(maxlen=max(1, int(spec.max_queue)))
 
         self._drain_task: Optional[asyncio.Task] = None
         self._idle_task: Optional[asyncio.Task] = None
@@ -127,16 +134,12 @@ class Job:
         if self.mode == "drop" and (self._busy or self._has_pending()):
             return
 
-        if self.mode == "queue":
-            self._queue.append((args, kwargs))
-        else:  # latest / drop
-            self._latest = (args, kwargs)
+        self._latest = (args, kwargs)
 
         self._ensure_drain()
         self._arm_idle(self._gen)
 
     def cancel(self) -> None:
-        # Note: cancel can be called from any thread; forward if needed.
         if threading.get_ident() != self._loop_thread_id:
             self.loop.call_soon_threadsafe(self.cancel)
             return
@@ -146,14 +149,16 @@ class Job:
         if self._idle_task:
             self._idle_task.cancel()
         self._latest = None
-        self._queue.clear()
+
+    def shutdown(self) -> None:
+        self.cancel()
+        if self._owned_executor is not None:
+            self._owned_executor.shutdown(wait=False, cancel_futures=True)
 
     def _has_pending(self) -> bool:
-        return bool(self._queue) if self.mode == "queue" else (self._latest is not None)
+        return self._latest is not None
 
     def _pop_next(self):
-        if self.mode == "queue":
-            return self._queue.popleft() if self._queue else None
         item = self._latest
         self._latest = None
         return item
@@ -188,7 +193,6 @@ class Job:
         if not self.idle_after:
             return
 
-        # cancel previous idle task
         if self._idle_task and not self._idle_task.done():
             self._idle_task.cancel()
 
@@ -205,5 +209,5 @@ class Job:
             except asyncio.CancelledError:
                 pass
 
-        # Create idle task on the scheduler loop
+        # Always create tasks on the scheduler's loop
         self._idle_task = self.loop.create_task(idle())

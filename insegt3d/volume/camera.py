@@ -47,7 +47,7 @@ class Camera:
         cam.w = np.array(d["w"], dtype=np.float32)
         cam.zoom = float(d["zoom"])
         return cam
-        
+
     def reset(self, volume_shape):
 
         self.origin = volume_shape / 2
@@ -61,10 +61,6 @@ class Camera:
     @property
     def uvw(self):
         return self.u.astype(np.float32), self.v.astype(np.float32), self.w.astype(np.float32)
-
-    def plane_coords(self, p):
-        r = np.asarray(p, np.float32) - self.origin.astype(np.float32)
-        return float(r @ self.u), float(r @ self.v), float(r @ self.w)
 
     def world_coords(self, d, y, x):
         return self.origin + float(d) * self.u + float(y) * self.v + float(x) * self.w
@@ -131,7 +127,7 @@ class Camera:
 
         return u
 
-    def randomize(self,):
+    def randomize(self):
         """
         Randomizes camera orientation.
         """
@@ -150,7 +146,7 @@ class Camera:
         delta_world = t[0] * self.u + t[1] * self.v + t[2] * self.w
 
         self.origin = self.origin + delta_world
-    
+
     def pan(self, dx, dy):
         """
         Pans along the v-w plane.

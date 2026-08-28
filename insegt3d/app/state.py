@@ -20,15 +20,29 @@ class OverlayState:
 @dataclass
 class UIState:
     viewport_shape: tuple[int, int] = (768, 768)
-    mask: OverlayState = field(default_factory=OverlayState)
+    # Persisted annotation mask ("Annotation overlay" in the UI), on by default.
+    mask: OverlayState = field(default_factory=lambda: OverlayState(visible=True))
     annotation: OverlayState = field(default_factory=OverlayState)
+    # Live, model-in-progress prediction ("Live prediction overlay" in the UI).
     prediction: OverlayState = field(default_factory=OverlayState)
+    # Bulk prediction read from disk ("Prediction overlay" in the UI).
+    saved_prediction: OverlayState = field(default_factory=OverlayState)
     show_orientation: bool = False
     jpeg_quality: int = 80
+    intensity_low: float = 0.0
+    intensity_high: float = 255.0
+
+    def max_brush_size(self, max_scale=0.25):
+        """
+        Largest brush diameter (px) that still fits entirely inside the
+        viewport: the smaller of its two dimensions, scaled by given factor.
+        """
+        return min(self.viewport_shape) * max_scale
 
 @dataclass
 class NavigationState:
     slice_shape: tuple[int, int] = (768, 768)
+    max_slice_megapixels: float = 2.0  # Limits how much data is read from the zarr volume per slice
     revision: int = 0  # increments on any change that invalidates results
 
     def bump(self):
@@ -38,7 +52,7 @@ class NavigationState:
 @dataclass
 class AnnotationState:
     annotating: bool = False
-    mode: str = 'draw' # Interaction mode: None | "draw" | "save" | "flood" | "mask_fill"
+    mode: str = 'draw'  # 'draw' | 'save' | 'flood' | 'mask_fill'
     brush_size: int = 3
     colors: List[str] = field(default_factory=lambda: [
         'rgba(230, 25, 75, 1)', 'rgba(60, 180, 75, 1)',
@@ -82,24 +96,19 @@ class DataState:
     project_path: Path = field(default_factory=lambda: Path.cwd() / "default_project")
     zarr_files: List[Path] = field(default_factory=list)
     zarr_idx: int = 0
+    cache_size_mb: int = 24000 # Total tensorstor cache limit for viewing and reading data
 
     @property
     def active_zarr(self) -> Optional[Path]:
         if not self.zarr_files:
             return None
-        # Clamp idx to valid range to avoid IndexError
-        self.zarr_idx = max(0, min(self.zarr_idx, len(self.zarr_files) - 1))
-        return self.zarr_files[self.zarr_idx]
+        idx = max(0, min(self.zarr_idx, len(self.zarr_files) - 1))
+        return self.zarr_files[idx]
 
 @dataclass
 class PointerState:
     x: int = 0
     y: int = 0
-
-@dataclass
-class ProjectionState:
-    projection: object = None
-    depth: int = 8
 
 @dataclass
 class TrainState:
@@ -115,6 +124,11 @@ class TrainState:
     steps_per_epoch: int = 20
     ema_decay: float = 0.9
     loss_fn: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor] = metrics.mcc_ce_loss
+    model_locked: bool = False
+    predicting: bool = False
+    export_tiff: bool = False  # Also write predictions as a tiff stack
+    live_training_enabled: bool = True
+    cache_size_mb: int = 8000 # Total tensorstor cache limit for training
 
 @dataclass
 class AppState:
@@ -124,7 +138,6 @@ class AppState:
     annot: AnnotationState = field(default_factory=AnnotationState)
     data: DataState = field(default_factory=DataState)
     pointer: PointerState = field(default_factory=PointerState)
-    proj: ProjectionState = field(default_factory=ProjectionState)
     train: TrainState = field(default_factory=TrainState)
 
     @classmethod
@@ -139,8 +152,9 @@ class AppState:
 @dataclass
 class AppServices:
     state: AppState
-    slicer: VolumeSlicer = field(default_factory=VolumeSlicer)
+    slicer: VolumeSlicer = field(init=False)
     tracker: AnnotationTracker = field(init=False)
 
     def __post_init__(self):
+        self.slicer = VolumeSlicer(cache_size_mb=self.state.data.cache_size_mb)
         self.tracker = AnnotationTracker(str(self.state.data.project_path))

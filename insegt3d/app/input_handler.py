@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from typing import Dict, List
 
 class InputHandler:
-    
+
     def __init__(self, state, tools):
         self.state = state
         self.tools = tools

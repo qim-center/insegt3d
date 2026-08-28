@@ -1,3 +1,4 @@
+import sys
 import argparse
 import numpy as np
 from nicegui import ui, app
@@ -32,8 +33,16 @@ def _normalize_base_path(base_path: str | None) -> str:
     return normalized
 
 def main():
+    argv = sys.argv[1:]
+
+    if argv and argv[0] == 'predict':
+        from insegt3d.cli import run_predict
+        run_predict(argv[1:])
+        return
+
     parser = argparse.ArgumentParser(
-        description='Interactive U-Net Segmentation Tool'
+        description='Interactive U-Net Segmentation Tool',
+        epilog='Run "insegt3d predict --help" for batch prediction from the command line.'
     )
     parser.add_argument(
         '--project_folder',
@@ -68,43 +77,9 @@ def main():
         choices=range(2, 11),
         help='Number of classes (must be between 2 and 10)'
     )
-    parser.add_argument(
-        '--model',
-        type=str,
-        default='U-Net',
-        choices=[
-            "U-Net",
-            "U-Net++",
-            "FPN",
-            "PSPNet",
-            "DeepLabV3",
-            "DeepLabV3+",
-            "LinkNet",
-            "MA-Net",
-            "PAN",
-            "UPerNet",
-            "Segformer",
-        ],
-        help=(
-            "Segmentation model architecture. One of: "
-            "U-Net, U-Net++, FPN, PSPNet, DeepLabV3, "
-            "DeepLabV3+, LinkNet, MA-Net, PAN, UPerNet, Segformer. "
-        )
-    )
-    parser.add_argument(
-        '--encoder',
-        type=str,
-        default='resnet34',
-        help=(
-            "Encoder backbone architecture. "
-            "See https://smp.readthedocs.io/en/latest/encoders.html "
-            "and https://smp.readthedocs.io/en/latest/encoders_timm.html "
-            "for available options."
-        )
-    )
     args = parser.parse_args()
 
-    # Use provided port or fall back to a random port between 20000-40000
+    # Fall back to a random high port when none is given
     port = args.port if args.port else np.random.randint(20000, 40000)
     root_path = _normalize_base_path(args.server_base_path)
 

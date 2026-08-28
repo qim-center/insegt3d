@@ -5,7 +5,7 @@ from numba import njit, prange
 
 
 class ViewportRenderer:
-    
+
     def __init__(self, state):
 
         self.state = state
@@ -18,17 +18,12 @@ class ViewportRenderer:
         self.mask = self._init_zero_image()
         self.annotation = self._init_zero_image()
         self.prediction = self._init_zero_image()
-        self.raw_prediction = self._init_zero_image()[:,:,0]
-        self.viewport_image = self._init_zero_image()
-    
+        self.saved_prediction = self._init_zero_image()
+        self.raw_prediction = np.zeros(self.ui.viewport_shape, dtype=np.uint8)
+        self.raw_image = None
+
     def _init_zero_image(self):
         return np.zeros(self.ui.viewport_shape + (3,), dtype=np.uint8)
-
-    def clear_image(self):
-        self.image = self._init_zero_image()
-
-    def clear_mask(self):
-        self.mask = self._init_zero_image()
 
     def clear_annotation(self):
         self.annotation = self._init_zero_image()
@@ -36,20 +31,22 @@ class ViewportRenderer:
     def clear_prediction(self):
         self.prediction = self._init_zero_image()
 
-    def clear_viewport_image(self):
-        self.viewport_image = self._init_zero_image()
+    def clear_saved_prediction(self):
+        self.saved_prediction = self._init_zero_image()
 
     def update_svg(self, content):
         self.viewport.content = content
 
-    def update(self, image=None, mask=None, annotation=None, prediction=None):
+    def prediction_in_viewport(self):
+        """
+        Latest live prediction labels, cropped/padded to the viewport shape.
+        """
+        return self._to_viewport_shape(self.raw_prediction, resize=False)
 
-        # Get some state variables
-        ui = self.state.ui
-        camera = self.state.camera
+    def update(self, image=None, mask=None, annotation=None, prediction=None, saved_prediction=None):
 
-        # Check inputs
         if image is not None:
+            self.raw_image = image
             self.image = self._process_image(image)
         if mask is not None:
             self.mask = self._process_mask(mask)
@@ -58,8 +55,21 @@ class ViewportRenderer:
         if prediction is not None:
             self.raw_prediction = prediction.copy()
             self.prediction = self._process_mask(prediction, resize=False)
+        if saved_prediction is not None:
+            self.saved_prediction = self._process_mask(saved_prediction)
 
-        # Build overlay_list and alpha_list
+        self._composite_and_render()
+
+    def refresh_intensity_scaling(self):
+        if self.raw_image is not None:
+            self.image = self._process_image(self.raw_image)
+        self._composite_and_render()
+
+    def _composite_and_render(self):
+
+        ui = self.state.ui
+        camera = self.state.camera
+
         overlay_list = []
         alpha_list = []
 
@@ -71,14 +81,16 @@ class ViewportRenderer:
             overlay_list.append(self.annotation)
             alpha_list.append(ui.annotation.alpha)
 
+        if ui.saved_prediction.visible:
+            overlay_list.append(self.saved_prediction)
+            alpha_list.append(ui.saved_prediction.alpha)
+
         if ui.prediction.visible:
             overlay_list.append(self.prediction)
             alpha_list.append(ui.prediction.alpha)
 
-        # Build overlay
         viewport_image = self._build_overlay(self.image, overlay_list, alpha_list)
 
-        # Draw orientation widget
         if ui.show_orientation:
             viewport_image = self._draw_orientation_widget(
                 viewport_image,
@@ -86,13 +98,20 @@ class ViewportRenderer:
                 viewport_image.shape[:2],
             )
 
-        # Render to viewport
         self._render_to_viewport(viewport_image)
 
-    def _build_overlay(self, image, overlay_list=None, alpha_list=None):
+    def _build_overlay(self, image, overlay_list, alpha_list):
 
         if not overlay_list or not alpha_list:
             return image
+
+        target_shape = image.shape[:2]
+        filtered = [(o, a) for o, a in zip(overlay_list, alpha_list) if o.shape[:2] == target_shape]
+
+        if not filtered:
+            return image
+
+        overlay_list, alpha_list = zip(*filtered)
 
         masks = np.stack(overlay_list, axis=0)
 
@@ -107,9 +126,18 @@ class ViewportRenderer:
         _, encoded = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality])
         b64 = base64.b64encode(encoded).decode("ascii")
         self.viewport.set_source(f"data:image/jpeg;base64,{b64}")
-        self.viewport_image = viewport_image
 
     def _process_image(self, image):
+        low = self.state.ui.intensity_low
+        high = self.state.ui.intensity_high
+
+        image = image.astype(np.float32, copy=False)
+        if high > low:
+            image = (image - low) * (255.0 / (high - low))
+        else:
+            image = np.zeros_like(image)
+
+        image = np.clip(image, 0, 255)
         image = np.rint(image).astype(np.uint8, copy=False)
         image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
         return self._to_viewport_shape(image)
@@ -125,19 +153,18 @@ class ViewportRenderer:
 
         if resize:
             return cv2.resize(image, (W, H), interpolation=cv2.INTER_NEAREST)
-        else:
-            h, w = image.shape[:2]
 
-            # center crop
-            y0, x0 = max(0, (h - H)//2), max(0, (w - W)//2)
-            cropped = image[y0:y0+min(H,h), x0:x0+min(W,w)]
+        h, w = image.shape[:2]
 
-            # center pad
-            out = np.zeros((H, W, *image.shape[2:]), dtype=image.dtype)
-            py, px = (H - cropped.shape[0])//2, (W - cropped.shape[1])//2
-            out[py:py+cropped.shape[0], px:px+cropped.shape[1]] = cropped
+        # Center crop, then center pad back up to the viewport shape.
+        y0, x0 = max(0, (h - H) // 2), max(0, (w - W) // 2)
+        cropped = image[y0:y0 + min(H, h), x0:x0 + min(W, w)]
 
-            return out
+        out = np.zeros((H, W, *image.shape[2:]), dtype=image.dtype)
+        py, px = (H - cropped.shape[0]) // 2, (W - cropped.shape[1]) // 2
+        out[py:py + cropped.shape[0], px:px + cropped.shape[1]] = cropped
+
+        return out
 
     def _draw_orientation_widget(self, image, vectors, shape):
         H, W = shape
@@ -145,7 +172,6 @@ class ViewportRenderer:
         scale = min(H, W) * 0.4
 
         # cv2 draws in BGR; but image is RGB.
-        # Use RGB colors here (so it looks correct in RGB space).
         colors_rgb = ((255, 0, 0), (0, 255, 0), (0, 0, 255))
 
         for (_vz, vy, vx), color in zip(vectors, colors_rgb):

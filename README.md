@@ -71,9 +71,9 @@ data, axis order, and converting volumes larger than RAM.
 
 | Input | Action |
 | --- | --- |
-| **Left Click + Drag** | Paint with the selected class |
-| **Shift + Left Click** | Push the displayed prediction overlay into the annotation map |
-| **Mouse Wheel** | Adjust brush size |
+| Left Click + Drag | Paint with the selected class |
+| Shift + Left Click | Push the displayed prediction overlay into the annotation map |
+| Mouse Wheel | Adjust brush size |
 | C / X | Next / previous class colour |
 | D | Toggle the live prediction overlay |
 | Ctrl + Z | Undo last stroke |
@@ -83,10 +83,10 @@ data, axis order, and converting volumes larger than RAM.
 
 | Input | Action |
 | --- | --- |
-| **Ctrl + Left Click + Drag** | Pan |
-| **Ctrl + Right Click + Drag** | Scroll through slices |
-| **Ctrl + Middle Click + Drag** | Rotate the slicing plane |
-| **Ctrl + Mouse Wheel** | Zoom in and out |
+| Ctrl + Left Click + Drag | Pan |
+| Ctrl + Right Click + Drag | Scroll through slices |
+| Ctrl + Middle Click + Drag | Rotate the slicing plane |
+| Ctrl + Mouse Wheel | Zoom in and out |
 | Space | Randomize the orientation of the slicing plane |
 
 Touch input is supported as well: one finger pans, two fingers rotate and pinch-zoom.

@@ -10,8 +10,8 @@ The OME-Zarr format allows efficient and low-RAM annotation of large 3D volumes.
 
 ## Requirements
 
-- Python **3.13** or newer
-- A CUDA GPU is strongly recommended (training and prediction fall back to CPU, but will be VERY slow)
+- Python **3.13**
+- A CUDA GPU or an Apple Silicon Mac is strongly recommended (training and prediction fall back to CPU, but will be VERY slow). Intel Macs are not supported. On a Mac the GPU shares the system memory, so lower `--cache_gb` to leave room for it
 - Data stored as multiscale OME-Zarr 0.5 (Zarr v3) - see [Preparing data](docs/preparing-data.md)
 
 ## Installation with conda
@@ -28,7 +28,7 @@ pip install git+https://github.com/qim-center/insegt3d
 
 ```bash
 conda activate insegt3d
-insegt3d --project_folder "path/to/project_folder" --num_classes 2
+insegt3d --project_folder "path/to/project_folder"
 ```
 
 This creates the project folder if it does not exist, starts a server on a random free port, and prints a link to open in any web browser.
@@ -39,15 +39,17 @@ In the interface:
 2. Pick a volume under **Scan**.
 3. Navigate and begin annotating (see [Controls](#controls)). Once at least one annotation has been made for each class, a model will begin training in the background.
 4. Watch the **Live prediction overlay** improve as the model trains. Press <kbd>D</kbd> to toggle it on and off, or <kbd>Shift</kbd> + <kbd>Left Click</kbd> to accept part of the prediction as ground-truth annotation.
-5. When you are happy with the model, press **Predict** to run it over the whole volume. Tick **Also export tiff stack** first to write a tiff copy of each prediction alongside the zarr.
+5. When you are happy with the model, press **Predict** to run it over every loaded volume, then view the result with the **Prediction overlay**. Tick **Also export tiff stack** first to write a tiff copy of each prediction alongside the zarr.
 
 ### Command-line options
 
 | Option | Default | Description |
 | --- | --- | --- |
 | `--project_folder` | `./default_project` | Where masks, annotations, checkpoints and predictions are stored |
-| `--num_classes` | `2` | Number of classes to segment (2–10) |
 | `--port` | random | Port to serve the interface on |
+| `--host` | `localhost` | Address to serve on. Use `0.0.0.0` to allow access from other machines |
+| `--server_base_path` | none | URL prefix to serve under, e.g. behind a reverse proxy |
+| `--cache_gb` | `16` | Memory for cached volume data, in GiB. The app uses about 5 GiB on top of this, so lower it if the system starts swapping |
 
 Use `insegt3d --help` for the full list of options.
 
@@ -72,9 +74,12 @@ data, axis order, and converting volumes larger than RAM.
 | Input | Action |
 | --- | --- |
 | Left Click + Drag | Paint with the selected class |
+| Right Click + Drag | Erase (also the eraser end of a tablet pen) |
 | Shift + Left Click | Push the displayed prediction overlay into the annotation map |
 | Mouse Wheel | Adjust brush size |
-| C / X | Next / previous class colour |
+| B / E / G / F / K | Draw / Erase / Fill / Flood / Keep tool |
+| C | Next class colour |
+| 1–9, 0 | Select class 1–10 |
 | D | Toggle the live prediction overlay |
 | Ctrl + Z | Undo last stroke |
 | Ctrl + Y | Redo last stroke |
@@ -85,22 +90,52 @@ data, axis order, and converting volumes larger than RAM.
 | --- | --- |
 | Ctrl + Left Click + Drag | Pan |
 | Ctrl + Right Click + Drag | Scroll through slices |
+| Q / A | Step one slice up / down along the view normal |
 | Ctrl + Middle Click + Drag | Rotate the slicing plane |
 | Ctrl + Mouse Wheel | Zoom in and out |
 | Space | Randomize the orientation of the slicing plane |
+| Z / Y / X | View along the z, y or x axis, keeping the position and zoom |
+| , / . | Go to the previous / next annotated slice |
 
 Touch input is supported as well: one finger pans, two fingers rotate and pinch-zoom.
 
+Shortcuts are paused while typing in a text or number field. Press Enter or Esc, or click the
+viewport, to return to them. The keyboard button under the viewport lists every shortcut.
+
+The **Viewport** panel shows the slicing plane inside the volume's bounding box. Drag its arrows
+to move the plane, or the spheres on its rings to rotate it. Below it, **Z**, **Y** and **X** align
+the view to an axis, **Center** returns to the starting view, and **Go to** moves to a typed
+location (in full-resolution voxels) and slice normal. The arrows beside **Annotated slices** step
+through the slices you have annotated in the current volume, framing their strokes and turning on
+the annotation overlay.
+
+### Classes
+
+Projects start with two classes. Press **+** next to the class colours to add one (up to ten), or
+**−** to remove the selected class. Removing a class erases its annotations and renumbers the
+classes after it, which keep their colours. Classes can be changed at any time: the model keeps
+what it has learned, and training resumes once every class has an annotation.
+
 ### Annotation modes
 
-The **Mode** toggle in the **Annotation** panel switches between four ways of painting:
+The tool buttons at the top of the **Annotation** panel switch between five ways of painting
+(hover over them for their shortcuts):
 
 - **Draw** - freehand brush strokes in the selected class.
-- **Overlay** - brush strokes accept the current prediction inside them as annotation
-  (the same thing Shift does temporarily while held).
-- **Flood** - click a seed point and drag to grow an intensity-based flood fill; the drag
-  distance sets the tolerance.
+- **Erase** - brush strokes clear annotations of any class. In Draw, Erase and Keep mode,
+  right-click dragging or the eraser end of a tablet pen erases too.
 - **Fill** - click inside a region fully enclosed by existing annotations to fill it.
+- **Flood** - click a seed point and drag to grow an intensity-based flood fill. The drag
+  distance sets the tolerance.
+- **Keep** - brush strokes keep the live prediction inside them as annotation
+  (the same thing Shift does temporarily while held).
+
+### Display
+
+The **Display** panel toggles three overlays and sets their opacity: the **Annotation overlay**,
+the **Prediction overlay** (the result of **Predict**, once the current volume has one) and the
+**Live prediction overlay**. Drag the range under the histogram to set the intensity window. It
+starts at the 0.5th to 99.5th percentile of the volume.
 
 ## Training
 
@@ -108,11 +143,13 @@ Live training runs in the background while you annotate and is on by default. Un
 **Advanced settings** you can turn it off, pick a different architecture or encoder (any
 combination supported by
 [segmentation-models-pytorch](https://github.com/qubvel-org/segmentation_models.pytorch)),
-change the learning rate, batch size and steps per training burst, or reset the model and
-the annotations.
+set the **2.5D depth** (how many neighbouring slices the model sees) and the **Training
+resolution** (which pyramid level it trains and predicts on), choose the loss function and
+toggle SCNP, change the learning rate, batch size and steps per training burst, or reset the
+model and the annotations.
 
-Note that the architecture and encoder are locked once training has started. Use **Reset
-model** to change them.
+Note that the architecture, encoder, 2.5D depth and training resolution are locked once
+training has started. Use **Reset model** to change them.
 
 ## Batch prediction
 
@@ -127,16 +164,18 @@ insegt3d predict \
 ```
 
 `--data` accepts a single Zarr store, a folder of Zarr stores, or an `http(s)` URL.
-Results are written to `<output>/predictions/<volume_name>`.
+Results are written to `<output>/predictions/<volume_name>__<id>`, where `<id>` is a short hash of the volume's location.
+Each result is a zarr of per-class scores (`uint8`, 0-255) with the predicted class labels in a nested `labels` zarr.
+Prediction runs at the resolution the model was trained on. Volumes without that level are skipped and listed in
+`<output>/predictions/skipped_volumes.txt`.
 
 | Option | Default | Description |
 | --- | --- | --- |
 | `--checkpoint` | *required* | Trained checkpoint (`model.ckpt`) |
 | `--data` | *required* | Volume, folder of volumes, or `http(s)` URL |
 | `--output` | *required* | Output directory |
-| `--num-classes` | from checkpoint | Number of classes |
 | `--input-size` | `512` | Cubic block size used for inference |
-| `--batch-size` | auto | Inference batch size; defaults to the largest that fits in memory |
+| `--batch-size` | auto | Inference batch size. Defaults to the largest that fits in memory |
 | `--overlap` | `0.25` | Fractional overlap between adjacent blocks |
 | `--axes` | `0,1,2` | Axes to predict along and average over |
 | `--export-tiff` | off | Also write each prediction as a tiff stack |
@@ -148,7 +187,7 @@ Run `insegt3d predict --help` for the same list from the terminal.
 
 Both **Also export tiff stack** in the interface and `--export-tiff` on the command line
 write a second copy of the prediction next to the zarr, as
-`<output>/predictions/<volume_name>_tiff/`. The folder holds one tiff per z slice, each
+`<output>/predictions/<volume_name>__<id>_tiff/`. The folder holds one tiff per z slice, each
 a channel-last `(y, x, c)` image whose channels are the per-class scores - the same data
 the zarr holds.
 
@@ -157,6 +196,7 @@ the zarr holds.
 ```
 project_folder/
 ├── annotations.json     # record of every annotated region and its camera pose
+├── classes.json         # class colours, in class order
 ├── model.ckpt           # latest trained model checkpoint
 ├── masks/               # per-volume annotation masks (zarr)
 ├── predictions/         # full-volume predictions (zarr, plus optional tiff stacks)

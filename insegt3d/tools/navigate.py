@@ -1,3 +1,4 @@
+import time
 import numpy as np
 
 from insegt3d.tools.base_tool import BaseTool
@@ -13,28 +14,26 @@ class NavigatorTool(BaseTool):
         self.zooming = False
         self.navigating = False
 
-        self._local_revision = 0
-        self.obliqueness = 0.0
+        self._next_properties = 0.0
+        self._pending_steps = 0
+        self._last_x = self._last_y = 0
 
-        # Dedicated lanes (sequential per job)
-        self.register_latest_job("nav_preview", self._do_preview, max_hz=60)
-        self.register_latest_job("nav_hires", self._do_hires, max_hz=10)
-
-    def update_obliqueness(self, u):
-        self.obliqueness = np.arccos(np.clip(np.max(np.abs(u)), -1.0, 1.0)) / np.arccos(1 / np.sqrt(3))
+        # nav_preview draws a quick, coarse frame while moving, and nav_hires refines it once the camera settles
+        self.scheduler.register_sync("nav_preview", self._do_preview, max_hz=60, idle_after=0.1, idle_kwargs={"settled": True})
+        self.scheduler.register_sync("nav_hires", self._do_hires, max_hz=10)
+        self.scheduler.register_sync("nav_overlays", self._do_overlays, max_hz=30)
+        self.scheduler.register_async("nav_step", self._do_step, max_hz=5)
 
     async def on_pointer(self, e):
 
-        s = self.state
-        ui, camera, p, nav = s.ui, s.camera, s.pointer, s.nav
+        camera, nav = self.state.camera, self.state.nav
 
-        # Navigation is tuned for a 768px slice; keep the feel at other sizes
+        # Navigation is tuned for a 768px slice, so keep the same feel at other sizes
         scale_factor = min(nav.slice_shape) / 768.0
 
-        dx = (p.x - e.x) * scale_factor
-        dy = (p.y - e.y) * scale_factor
+        dx = (self._last_x - e.x) * scale_factor
+        dy = (self._last_y - e.y) * scale_factor
 
-        # Mouse navigation only while ctrl is held
         if e.mouse and e.ctrl and not e.shift and not e.alt:
             if e.down:
                 self.panning = (e.button == 0)
@@ -47,26 +46,22 @@ class NavigatorTool(BaseTool):
                     self._request_preview()
                 elif self.rotating:
                     camera.rotate(-dx, -dy)
-                    self.update_obliqueness(camera.u)
                     self._request_preview()
                 elif self.scrolling:
                     dz = np.hypot(dx, dy)
-                    camera.scroll(dz if e.y < p.y else -dz)
+                    camera.scroll(dz if e.y < self._last_y else -dz)
                     self._request_preview()
 
             if e.wheel:
                 direction = -1 if e.delta_y < 0 else 1
                 zoom = 1.1 ** direction
                 camera.zoom_by(zoom)
-                self._request_preview()
                 self._request_hires()
 
             if e.up:
                 self.panning = self.rotating = self.scrolling = False
-                self._request_preview()
                 self._request_hires()
 
-        # Touch navigation
         elif e.touch:
             if e.down:
                 self.panning = e.one_finger
@@ -88,11 +83,10 @@ class NavigatorTool(BaseTool):
 
             if e.up:
                 self.panning = self.rotating = self.scrolling = self.zooming = False
-                self._request_preview()
                 self._request_hires()
 
-        ui.show_orientation = self.rotating
         self.navigating = self.panning or self.rotating or self.scrolling or self.zooming
+        self._last_x, self._last_y = e.x, e.y
 
     async def on_key(self, e):
 
@@ -105,89 +99,108 @@ class NavigatorTool(BaseTool):
             if e.key == "Shift":
                 self.panning = self.rotating = self.scrolling = self.zooming = self.navigating = False
 
+        if e.action.keydown and not e.modifiers.ctrl and e.key in ("q", "a"):
+            self._pending_steps += 1 if e.key == "q" else -1
+            self.scheduler.request("nav_step")
+
+        if e.action.keydown and not e.action.repeat and not e.modifiers.ctrl:
+            if e.key in ("z", "y", "x"):
+                self.callbacks.align_view(e.key.name)
+            elif e.key in (",", "."):
+                self.callbacks.step_plane(1 if e.key == "." else -1)
+
     def _request_preview(self):
         self.scheduler.request("nav_preview")
         self.scheduler.request("sync_navigator")
 
     def _request_hires(self):
-        self._local_revision = self.state.nav.bump()
+        self.scheduler.request("nav_preview")
         self.scheduler.request("nav_hires")
         self.scheduler.request("sync_navigator")
 
-    def _do_preview(self):
-        ui = self.state.ui
-        overlays = (ui.mask, ui.annotation, ui.prediction, ui.saved_prediction)
+    def _do_preview(self, settled=False):
+        if self.services.slicer.images is None:
+            return
 
-        # Hide overlays while navigating, then restore them afterwards
-        was_visible = [overlay.visible for overlay in overlays]
-        for overlay in overlays:
-            overlay.visible = False
+        # Idle callback: the pointer is held still mid-navigation, so refine the frame
+        if settled:
+            if self.navigating:
+                self.scheduler.request("nav_hires")
+            return
 
-        # Coarser level the further the view is from an axis-aligned slice
-        level_modifier = 3 if self.obliqueness > 0.3 else 2
+        camera = self.state.camera.copy()
+        # Previews are one level coarser (two when oblique) and show what arrives within 50 ms
+        coarsen = 1 + int(np.max(np.abs(camera.u)) < 0.98)
+        image, tiles = self._stream_image(camera, deadline=time.time() + 0.05, coarsen=coarsen)
+        for _ in tiles:
+            pass
 
-        self.renderer.update(image=self._extract_slice(level_modifier=level_modifier, order=1))
-        self.callbacks.update_properties()
+        self.renderer.update(image=image, version=camera.version, fit=False)
 
-        for overlay, visible in zip(overlays, was_visible):
-            overlay.visible = visible
+        if time.time() >= self._next_properties:
+            self._next_properties = time.time() + 0.1
+            self.callbacks.update_properties()
 
     def _do_hires(self):
 
-        # Reset overlays
-        self.renderer.clear_annotation()
-        self.renderer.clear_prediction()
-        self.renderer.clear_saved_prediction()
-
-        rev = self._local_revision
-        if self._cancelled(rev):
+        camera = self.state.camera.copy()
+        if self.services.slicer.images is None:
             return
 
-        image = self._extract_slice(level_modifier=0, order=1)
-        if self._cancelled(rev):
-            return
-
-        mask = self._extract_slice(level_modifier=0, mask=True)
-        if self._cancelled(rev):
-            return
-
-        saved_prediction = None
-        if self.services.slicer.has_prediction:
-            saved_prediction = self._extract_slice(level_modifier=0, prediction=True)
-            if self._cancelled(rev):
-                return
-
-        self.renderer.update(image=image, mask=mask, saved_prediction=saved_prediction)
-        self.callbacks.update_properties()
-
+        self.scheduler.request("nav_overlays")
         self.scheduler.request("live_predict")
 
-    def _cancelled(self, rev):
-        return self.navigating or (rev != self.state.nav.revision)
+        image, tiles = self._stream_image(camera)
+        next_render = time.time() + 0.1
 
-    def _get_output_shape(self, level_modifier):
-        """
-        Computes proper output_shape depending on level modifier.
-        Uses nav.slice_shape = (h, w).
-        """
+        for _ in tiles:
+            if camera.version != self.state.camera.version:
+                return
+            if time.time() >= next_render:
+                next_render = time.time() + 0.08
+                self.renderer.update(image=image, version=camera.version, quality=1)
+
+        self.renderer.update(image=image, version=camera.version, quality=1)
+        self.callbacks.update_properties()
+
+    def _do_overlays(self):
+        slicer = self.services.slicer
+        camera = self.state.camera.copy()
+        nav = self.state.nav
+
+        self.renderer.clear("annotation", "saved_prediction")
+
+        mask = slicer.get_data(camera, extent=nav.extent, out_shape=nav.slice_shape, mask=True)
+        saved_prediction = None
+        if slicer.has_prediction:
+            saved_prediction = slicer.get_data(camera, extent=nav.extent, out_shape=nav.slice_shape, prediction=True)
+
+        self.renderer.update(mask=mask, saved_prediction=saved_prediction, version=camera.version)
+
+    async def _do_step(self):
+        steps, self._pending_steps = self._pending_steps, 0
+        slicer, camera = self.services.slicer, self.state.camera
+        if slicer.images is None:
+            return
+        camera.step(steps * np.linalg.norm(slicer.voxel_sizes[0] * camera.u))
+        self._request_hires()
+
+    def _stream_image(self, camera, deadline=None, coarsen=0):
+        slicer = self.services.slicer
+
+        # 0 when axis-aligned, 1 along a cube diagonal
+        obliqueness = np.arccos(np.clip(np.max(np.abs(camera.u)), -1.0, 1.0)) / np.arccos(1 / np.sqrt(3))
+
+        keep_level = slicer.level(camera.zoom, 3 if obliqueness > 0.3 else 2)
+        target = slicer.level(camera.zoom, coarsen)
+        # Coarse to fine: the in-memory fallback, then each level down to the target
+        fallback = [slicer.fallback] if target < slicer.fallback[0] else []
+        sources = fallback + slicer.sources(range(max(slicer.fallback[0] - 1, target), target - 1, -1))
+
+        tile_hw = int(np.clip(256 / (1 + 4 * obliqueness), 96, 256))
+
         h, w = self.state.nav.slice_shape
+        image = np.zeros((max(1, h >> coarsen), max(1, w >> coarsen)), dtype=np.float32)
+        tiles = slicer.stream(camera, image[None], sources, self.state.nav.extent, keep_level=keep_level, deadline=deadline, order=1, tile_hw=tile_hw)
 
-        scaled_h = max(1, int(round(h / (2 ** level_modifier))))
-        scaled_w = max(1, int(round(w / (2 ** level_modifier))))
-
-        return (scaled_h, scaled_w)
-
-    def _extract_slice(self, level_modifier, order=0, mask=False, prediction=False):
-        h, w = self.state.nav.slice_shape
-        half_h, half_w = h // 2, w // 2
-        extent = (0, 0, -half_h, half_h, -half_w, half_w)
-
-        return self.services.slicer.get_data(
-            self.state.camera,
-            extent=extent,
-            out_shape=self._get_output_shape(level_modifier),
-            level_modifier=level_modifier,
-            order=order,
-            mask=mask,
-            prediction=prediction,
-        )
+        return image, tiles

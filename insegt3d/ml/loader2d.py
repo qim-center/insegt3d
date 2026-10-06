@@ -1,178 +1,124 @@
 import numpy as np
 from pathlib import Path
-import tensorstore as ts
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, Sampler
 
 from insegt3d.volume.slicer import VolumeSlicer
-from insegt3d.volume.io import read_multiscale_masks
+from insegt3d.volume.io import volume_folder_name
 from insegt3d.volume.intensity import robust_normalize
 
-class LiveTrainingDataset(Dataset):
-    """
-    Samples (image, mask, weight) directly from volumes using stored annotations.
-    """
+class LiveTrainingDataset:
+    """Samples (image, mask, weight) directly from volumes using stored annotations."""
 
-    def __init__(self, tracker, input_size=512, num_classes=2, axis=0, cache_size_mb=8000):
+    def __init__(self, tracker):
         self.tracker = tracker
         self.rng = np.random.default_rng()
 
         self._slicers = {}
-        self._ts_context = ts.Context({
-            'cache_pool': {'total_bytes_limit': int(cache_size_mb * 1024**2)}
-        })
+        self._ts_context = None
 
-        self.project_path = self.tracker.project_path
-        self.input_size = int(input_size)
-        self.num_classes = int(num_classes)
-        self.axis = int(axis)
+    def batches(self, train, ts_context):
+        """Yields batches holding one annotation per class (for a random subset if there are more classes than samples)."""
+        if ts_context is not self._ts_context:
+            self._slicers.clear()
+            self._ts_context = ts_context
 
-    def __len__(self):
-        return len(self.tracker.annotations())
+        for _ in range(train.steps_per_epoch):
+            anns = self.tracker.annotations()
 
-    def _augment_camera(self, camera):
-        """
-        Randomizes the sampled view around a stored annotation
-        """
+            by_class = {}
+            for a in anns:
+                by_class.setdefault(a.class_idx, []).append(a)
+
+            if len(by_class) < train.num_classes:
+                return
+
+            classes = list(by_class.values())
+            self.rng.shuffle(classes)
+
+            chosen = [group[self.rng.integers(len(group))] for group in classes]
+
+            while len(chosen) < train.batch_size:
+                chosen.append(anns[self.rng.integers(len(anns))])
+
+            batch = [torch.stack(tensors) for tensors in zip(*(self.sample(ann, train) for ann in chosen[:train.batch_size]))]
+            yield [tensor.pin_memory() for tensor in batch] if torch.cuda.is_available() else batch
+
+    def _augment_camera(self, camera, spacing, input_size):
         camera.rotate_axis('u', self.rng.uniform(0, 2 * np.pi))
 
-        max_shift = 0.5 * float(self.input_size)
+        max_shift = 0.5 * float(input_size) * spacing
         dy = self.rng.uniform(-max_shift, max_shift)
         dx = self.rng.uniform(-max_shift, max_shift)
         camera.origin = camera.origin + dy * camera.v + dx * camera.w
 
-        camera.zoom = self.rng.uniform(0.9, 1.1)
+        camera.zoom = spacing * self.rng.uniform(0.9, 1.1)
         return camera
 
-    def __getitem__(self, idx):
-        ann = self.tracker.annotations()[idx]
-
+    def sample(self, ann, train):
         volume_path = str(ann.volume_path)
-        mask_path = Path(self.project_path) / 'masks' / Path(ann.volume_path).name
+        mask_path = Path(self.tracker.project_path) / 'masks' / volume_folder_name(ann.volume_path)
 
         slicer = self._slicers.get(volume_path)
         if slicer is None:
             slicer = VolumeSlicer(ts_context=self._ts_context)
             slicer.initialize(ann.volume_path, mask_path, ann.camera)
             self._slicers[volume_path] = slicer
-        else:
-            level_shapes = [image.shape for image in slicer.images]
-            slicer.masks = read_multiscale_masks(mask_path, level_shapes, ts_context=slicer.ts_context)
+        elif slicer.masks is None and mask_path.exists():
+            slicer.masks = slicer.read_masks()
 
-        camera = self._augment_camera(ann.camera.copy())
+        size, slab_size, level = train.input_size, train.slab_size, train.level
 
-        half = self.input_size // 2
+        # Volume lacks this level: an all-zero weight makes the sample contribute nothing
+        if len(slicer.images) <= level:
+            return torch.zeros(slab_size, size, size), torch.zeros(train.num_classes, size, size, dtype=torch.long), torch.zeros(1, size, size)
+
+        camera = self._augment_camera(ann.camera.copy(), slicer.voxel_sizes[level].min(), size)
+
+        half = size // 2
         extent = (0, 0, -half, half, -half, half)
+
+        d0 = -(slab_size // 2)
 
         img = slicer.get_data(
             camera,
-            extent=extent,
-            out_shape=(self.input_size, self.input_size),
+            extent=(d0, d0 + slab_size - 1, -half, half, -half, half),
+            out_shape=(slab_size, size, size),
             mask=False,
             order=1,
-            axis=self.axis,
+            level=level,
         )
 
         msk = slicer.get_data(
             camera,
             extent=extent,
-            out_shape=(self.input_size, self.input_size),
+            out_shape=(size, size),
             mask=True,
             order=0,
-            axis=self.axis,
+            level=level,
         )
 
-        x = torch.from_numpy(robust_normalize(img))[None]
+        img = robust_normalize(img.reshape(slab_size, size, size))
+        img = np.clip(img * self.rng.uniform(0.9, 1.1) + self.rng.uniform(-0.05, 0.05), 0.0, 1.0)
+
+        x = torch.from_numpy(img)
         y = torch.from_numpy(msk).long()
 
+        # Label 0 (unannotated) gets zero weight, and labels 1..N become classes 0..N-1
         w = (y != 0).float()[None]
 
         y = torch.clamp(y - 1, min=0)
-        y = F.one_hot(y, num_classes=self.num_classes)
+        y = F.one_hot(y, num_classes=train.num_classes)
         y = y.permute(2, 0, 1)
 
         return x, y, w
 
-class RecencySampler(Sampler):
-    """
-    Ensures each batch contains at least one annotation per class.
-    Favors recent annotations via temperature.
-    """
-
-    def __init__(self, tracker, batch_size=4, steps=20, recency_temp=20.0):
-        self.tracker = tracker
-        self.batch_size = batch_size
-        self.steps = steps
-        self.recency_temp = max(recency_temp, 1e-6)  # avoid divide-by-zero below
-        self.rng = np.random.default_rng()
-
-    def __len__(self):
-        return self.steps
-
-    def __iter__(self):
-        for _ in range(self.steps):
-            anns = self.tracker.annotations()
-            if not anns:
-                continue
-
-            times = np.array([a.time_idx for a in anns], dtype=np.float32)
-            tmax = times.max()
-            weights = np.exp(-(tmax - times) / self.recency_temp)
-            weights /= weights.sum()
-
-            by_class = {}
-            for i, a in enumerate(anns):
-                by_class.setdefault(a.class_idx, []).append(i)
-
-            chosen = []
-
-            # One sample per class first, then fill the rest of the batch
-            for idxs in by_class.values():
-                idxs = np.array(idxs)
-                p = weights[idxs]
-                p /= p.sum()
-                chosen.append(int(self.rng.choice(idxs, p=p)))
-
-            while len(chosen) < self.batch_size:
-                chosen.append(int(self.rng.choice(len(anns), p=weights)))
-
-            yield chosen[:self.batch_size]
-
-def collate_x_y_w(batch):
-    x = torch.stack([b[0] for b in batch])
-    y = torch.stack([b[1] for b in batch])
-    w = torch.stack([b[2] for b in batch])
-    return x, y, w
-
-def build_dataloader(
-    tracker,
-    input_size=512,
-    num_classes=4,
-    batch_size=4,
-    steps_per_epoch=20,
-    recency_temp=20.0,
-    cache_size_mb=8000,
-):
-    dataset = LiveTrainingDataset(
-        tracker=tracker,
-        input_size=input_size,
-        num_classes=num_classes,
-        cache_size_mb=cache_size_mb,
-    )
-
-    sampler = RecencySampler(
-        tracker=tracker,
-        batch_size=batch_size,
-        steps=steps_per_epoch,
-        recency_temp=recency_temp,
-    )
-
-    return DataLoader(
-        dataset,
-        batch_sampler=sampler,
-        collate_fn=collate_x_y_w,
-        num_workers=0,
-        pin_memory=True,
-    )
+def prefetch(iterable):
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        iterator = iter(iterable)
+        pending = pool.submit(next, iterator, None)
+        while (item := pending.result()) is not None:
+            pending = pool.submit(next, iterator, None)
+            yield item

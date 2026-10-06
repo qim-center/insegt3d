@@ -1,218 +1,171 @@
 import zarr
 import time
 import shutil
+import tempfile
 import numpy as np
 from tqdm import tqdm
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
+import torch.nn.functional as F
 
-from insegt3d.volume.io import get_scale_paths, write_level0_array, add_multiscales, write_multiscale_metadata, write_tiff_stack
-from insegt3d.volume.intensity import robust_normalize
+from insegt3d.volume.io import get_scale_paths, read_multiscale_zarr, write_level0_array, add_multiscales, write_tiff_stack, normalize_zarr_path, volume_folder_name
+from insegt3d.volume.intensity import robust_percentile_range
+
+TEMP_CHUNK = 128
+OUTPUT_CHUNKS = (64, 64, 64)
+OUTPUT_SHARDS = (256, 256, 256)
 
 
 class PredictionCancelled(Exception):
-    """Raised to unwind out of a prediction run when cancellation is requested."""
 
     def __init__(self, volume_name=None):
         super().__init__(f"Prediction cancelled during volume: {volume_name}" if volume_name else "Prediction cancelled")
         self.volume_name = volume_name
 
 
-def find_max_batch_size(model, input_size=256, start=4, max_limit=512):
-
-    batch_size = start
-    best = start
-
-    device = next(model.parameters()).device
-
-    while batch_size <= max_limit:
-        try:
-            with torch.inference_mode():
-                # Make a fake batch to test memory use
-                test_batch = torch.zeros(
-                    (batch_size, 1, input_size, input_size),
-                    dtype=torch.float16 if device.type == "cuda" else torch.float32,
-                    device=device
-                )
-                _ = model(test_batch)
-
-            best = batch_size
-            batch_size *= 2  # Try next larger
-
-            if device.type == 'cuda':
-                torch.cuda.empty_cache()
-
-        except RuntimeError as e:
-            if "out of memory" not in str(e).lower():
-                raise
-            if device.type == 'cuda':
-                torch.cuda.empty_cache()
-            break  # Too big, stop searching
-
-    del test_batch
-    if device.type == 'cuda':
-        torch.cuda.empty_cache()
-
-    return best
-
 def predict_block(model, block, num_classes=2, batch_size=8, axes=(0,1,2)):
 
     input_size = block.shape[0]
 
     device = next(model.parameters()).device
+    slab_size = model.num_channels
 
-    block_prediction = np.zeros((input_size, input_size, input_size, num_classes), dtype=np.float32)
+    offsets = torch.arange(slab_size) - slab_size // 2
+    lo, hi = robust_percentile_range(block)
+
+    block = torch.from_numpy(block.astype(np.float32, copy=False))
+    block_prediction = np.zeros((num_classes, input_size, input_size, input_size), dtype=np.float32)
 
     for axis in axes:
 
-        with torch.inference_mode():
+        with torch.inference_mode(), torch.autocast(device.type):
 
             block_t = torch.moveaxis(block, axis, 0)
 
             for i in range(0, input_size, batch_size):
 
-                batch = block_t[i:i+batch_size].unsqueeze(1)
+                start, stop = max(0, i - slab_size // 2), min(input_size, i + batch_size + slab_size // 2)
+                slices = ((block_t[start:stop].to(device=device, dtype=torch.float32) - lo) / (hi - lo)).clamp_(0.0, 1.0)
 
-                dtype = torch.float16 if device.type == "cuda" else torch.float32
-                batch = batch.to(device=device, dtype=dtype)
+                # Each slice gets its slab_size neighbours as channels, clamped at the block edges
+                idx = torch.arange(i, min(i + batch_size, input_size))[:, None] + offsets
+                batch = slices[(idx.clamp(0, input_size - 1) - start).to(device)]
 
-                batch_prediction = model(batch)
-                batch_prediction = batch_prediction.permute(0, 2, 3, 1).float().cpu().numpy()
+                batch_prediction = model(batch).float().cpu().numpy()
 
-                # Accumulate predictions into correct orientation depending on axis
-                if axis == 0:   # Z axis
-                    block_prediction[i:i+batch_size, :, :, :] += batch_prediction
-                elif axis == 1: # Y axis
-                    block_prediction[:, i:i+batch_size, :, :] += batch_prediction.transpose(1, 0, 2, 3)
-                elif axis == 2: # X axis
-                    block_prediction[:, :, i:i+batch_size, :] += batch_prediction.transpose(1, 2, 0, 3)
+                # Move the batch dimension back to the sliced axis, giving (C, Z, Y, X)
+                if axis == 0:
+                    block_prediction[:, i:i+batch_size] += batch_prediction.transpose(1, 0, 2, 3)
+                elif axis == 1:
+                    block_prediction[:, :, i:i+batch_size] += batch_prediction.transpose(1, 2, 0, 3)
+                elif axis == 2:
+                    block_prediction[:, :, :, i:i+batch_size] += batch_prediction.transpose(1, 2, 3, 0)
 
     block_prediction /= len(axes)
 
     return block_prediction
 
-def setup_model(model_path, input_size=512, batch_size=None):
-
-    torch.set_float32_matmul_precision('medium')
-
-    # Get CUDA device if available
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    # Load model
-    if not model_path.is_file():
-        raise FileNotFoundError(f"Model checkpoint not found: {model_path}")
-    checkpoint = torch.load(model_path, weights_only=False)
-    model = checkpoint['model'].to(device)
-    model.eval()
-
-    if device.type == "cuda":
-        model = model.half()
-
-    if batch_size is None:
-        batch_size = find_max_batch_size(model, input_size=input_size, start=4, max_limit=input_size)
-        print(f'Found optimal inference batch size of {batch_size}.')
-    else:
-        print(f'Using batch size of {batch_size}.')
-
-    return model, batch_size, checkpoint['num_classes']
-
-
-def predict_volume(zarr_file, prediction_file, temp_folder, model, window, input_size=512, num_classes=2, batch_size=None, overlap=0.25, axes=(0,1,2), tiff_folder=None, progress_callback=None, cancel_event=None):
-
-    if batch_size is None:
-        raise ValueError("batch_size must be provided")
-    if model is None:
-        raise ValueError("model must be provided")
-    if window is None:
-        window = gaussian_3d(input_size, sigma=0.125).astype('float32')
+def predict_volume(zarr_file, prediction_file, temp_folder, model, batch_size, input_size=512, num_classes=2, level=0, overlap=0.25, axes=(0,1,2), tiff_folder=None, progress_callback=None, cancel_event=None):
 
     start_time = time.time()
 
-    level0 = get_scale_paths(zarr_file)[0]
-    volume = zarr.open(str(zarr_file), mode='r')[level0] # Load highest resolution
-    chunk_size = volume.chunks[-3]
-    shard_size = volume.shards[-3]
-    input_volume_shape = np.array(volume.shape[-3:])
+    zarr_name = prediction_file.name
+
+    images, scales, translations = read_multiscale_zarr(zarr_file, cache_size_mb=512)
+    volume = images[level]
+    input_volume_shape = np.array(volume.shape)
     spatial_shape = tuple(input_volume_shape.astype(int).tolist())
-    spatial_chunks = (chunk_size, chunk_size, chunk_size)
-    spatial_shards = (shard_size, shard_size, shard_size)
+    # Blocks are cubic in world space and resampled to input_size voxels per side
+    block_shape = tuple(int(n) for n in np.maximum(1, np.round(input_size * scales[level].min() / scales[level])))
+    window = gaussian_3d(block_shape)
 
     output_volume_shape = (num_classes,) + spatial_shape
-    
+
     label_file = prediction_file / 'labels'
 
-    # Ensure temp directory exists and is clean
     temp_folder.mkdir(parents=True, exist_ok=True)
-    pred_folder = temp_folder / 'pred.zarr'
-    if pred_folder.is_dir():
-        shutil.rmtree(pred_folder)
+    scratch = Path(tempfile.mkdtemp(dir=temp_folder))
 
     try:
-        # Initialize temporary prediction volume.
+        # The extra last channel accumulates the blending weights
         pred_root, pred = write_level0_array(
-            str(pred_folder), output_volume_shape, 'float16',
-            spatial_chunks, spatial_shards)
-        write_multiscale_metadata(pred_root, num_levels=1, name='pred')
+            str(scratch / 'pred.zarr'), (num_classes + 1,) + spatial_shape, 'float16', (TEMP_CHUNK,) * 3)
 
-        # Get block coordinates
-        block_coords, padded_block_coords, local_block_coords = get_block_coordinates(input_volume_shape, input_size=input_size, overlap=overlap)
+        block_coords, padded_block_coords, local_block_coords = get_block_coordinates(input_volume_shape, input_size=block_shape, overlap=overlap, align=TEMP_CHUNK)
         num_blocks = len(padded_block_coords)
 
-        print(f'\nSegmenting {zarr_file.name}...')
-        for i in tqdm(range(num_blocks)):
+        print(f'\nSegmenting {zarr_name}...')
+        # The next block is read while the current one is predicted
+        with ThreadPoolExecutor(max_workers=1) as reader:
+            next_block = reader.submit(get_padded_block, volume, *padded_block_coords[0])
 
-            if cancel_event is not None and cancel_event.is_set():
-                raise PredictionCancelled(zarr_file.name)
+            for i in tqdm(range(num_blocks)):
 
-            padded_block = get_padded_block(volume, *padded_block_coords[i])
-            padded_block = torch.tensor(robust_normalize(padded_block))
+                if cancel_event is not None and cancel_event.is_set():
+                    raise PredictionCancelled(zarr_name)
 
-            # predict_block() returns (D,H,W,C)
-            predicted_block = predict_block(model, padded_block, num_classes=num_classes, batch_size=batch_size, axes=axes)
+                padded_block = next_block.result()
+                if i + 1 < num_blocks:
+                    next_block = reader.submit(get_padded_block, volume, *padded_block_coords[i + 1])
 
-            i0, j0, k0, i1, j1, k1 = block_coords[i]
-            l_i0, l_j0, l_k0, l_i1, l_j1, l_k1 = local_block_coords[i]
+                block = resample(padded_block, (input_size,) * 3, 'trilinear')
+                while True:
+                    try:
+                        prediction = predict_block(model, block, num_classes=num_classes, batch_size=batch_size, axes=axes)
+                        break
+                    except RuntimeError as e:
+                        if "out of memory" not in str(e).lower() or batch_size == 1:
+                            raise
+                        batch_size //= 2
+                        tqdm.write(f'Out of memory, retrying with batch size {batch_size}.')
+                predicted_block = resample(prediction, block_shape, 'area')
 
-            windowed = predicted_block[l_i0:l_i1, l_j0:l_j1, l_k0:l_k1, :] * window[l_i0:l_i1, l_j0:l_j1, l_k0:l_k1, None]
+                i0, j0, k0, i1, j1, k1 = block_coords[i]
+                l_i0, l_j0, l_k0, l_i1, l_j1, l_k1 = local_block_coords[i]
 
-            # pred/final_predictions store (C,Z,Y,X)
-            pred[:, i0:i1, j0:j1, k0:k1] += np.moveaxis(windowed, -1, 0)
+                # Blend overlapping blocks with a Gaussian window that down-weights block edges
+                weights = window[l_i0:l_i1, l_j0:l_j1, l_k0:l_k1]
+                windowed = predicted_block[:, l_i0:l_i1, l_j0:l_j1, l_k0:l_k1]
+                windowed *= weights
 
-            if progress_callback is not None:
-                completed = i + 1
-                elapsed = time.time() - start_time
-                eta_seconds = (elapsed / completed) * (num_blocks - completed)
-                progress_callback(completed, num_blocks, eta_seconds)
+                pred[:num_classes, i0:i1, j0:j1, k0:k1] += windowed
+                pred[num_classes, i0:i1, j0:j1, k0:k1] += weights
 
-        del volume
+                if progress_callback is not None:
+                    completed = i + 1
+                    elapsed = time.time() - start_time
+                    eta_seconds = (elapsed / completed) * (num_blocks - completed)
+                    progress_callback(completed, num_blocks, eta_seconds)
+
+        del volume, images
 
         print('Postprocessing predictions...')
 
         prediction_file.mkdir(parents=True, exist_ok=True)
         root, final_predictions = write_level0_array(
             str(prediction_file), output_volume_shape, 'uint8',
-            spatial_chunks, spatial_shards)
+            OUTPUT_CHUNKS, OUTPUT_SHARDS)
         label_root, final_labels = write_level0_array(
             str(label_file), spatial_shape, 'uint8',
-            spatial_chunks, spatial_shards)
+            OUTPUT_CHUNKS, OUTPUT_SHARDS)
 
-        # Normalize by shard
+        # Normalize by the accumulated weights and take the argmax, one shard at a time
         eps = 1e-3
-        for i0, j0, k0, i1, j1, k1 in get_shard_coordinates(input_volume_shape, shard_size=shard_size):
+        for i0, j0, k0, i1, j1, k1 in get_shard_coordinates(input_volume_shape, shard_size=OUTPUT_SHARDS[0]):
             if cancel_event is not None and cancel_event.is_set():
-                raise PredictionCancelled(zarr_file.name)
+                raise PredictionCancelled(zarr_name)
 
             p = pred[:, i0:i1, j0:j1, k0:k1].astype('float32')
-            w = np.maximum(compute_weight_map(window, block_coords, local_block_coords,
-                                              (i0, j0, k0, i1, j1, k1)), eps)
-            final_predictions[:, i0:i1, j0:j1, k0:k1] = (255 * p / w[None, ...]).astype('uint8')
-            final_labels[i0:i1, j0:j1, k0:k1] = (p.argmax(axis=0) + 1).astype('uint8')
+            scores = 255 * p[:num_classes] / np.maximum(p[num_classes], eps)
+            final_predictions[:, i0:i1, j0:j1, k0:k1] = np.clip(np.rint(scores), 0, 255).astype('uint8')
+            final_labels[i0:i1, j0:j1, k0:k1] = (p[:num_classes].argmax(axis=0) + 1).astype('uint8')
 
         del pred, final_predictions, final_labels, root, pred_root, label_root
 
-        add_multiscales(str(prediction_file))
-        add_multiscales(str(label_file))
+        add_multiscales(str(prediction_file), scale=scales[level], translation=translations[level])
+        add_multiscales(str(label_file), scale=scales[level], translation=translations[level])
 
         if tiff_folder is not None:
             print('Writing tiff stack...')
@@ -220,208 +173,130 @@ def predict_volume(zarr_file, prediction_file, temp_folder, model, window, input
             write_tiff_stack(zarr.open(str(prediction_file), mode='r')[pred_level0], tiff_folder)
 
     except BaseException:
-        # Remove the partial output for this volume
+        # Remove the partial output, including on cancellation
         if prediction_file.exists():
             shutil.rmtree(prediction_file)
         if tiff_folder is not None and tiff_folder.exists():
             shutil.rmtree(tiff_folder)
         raise
     finally:
-        if temp_folder.exists():
-            shutil.rmtree(temp_folder)
+        shutil.rmtree(scratch, ignore_errors=True)
 
     time_elapsed = time.time() - start_time
-    print(f'Completed volume {zarr_file.name} {tuple(input_volume_shape.astype(int).tolist())} in {time_elapsed}.')
+    print(f'Completed volume {zarr_name} {tuple(input_volume_shape.astype(int).tolist())} in {time_elapsed}.')
+
+    return batch_size
 
 
-def predict_all_volumes(zarr_files, project_path, model_path=None, predictions_dir=None, temp_dir=None, input_size=512, num_classes=None, batch_size=None, overlap=0.25, axes=(0,1,2), export_tiff=False, progress_callback=None, cancel_event=None):
+def predict_all_volumes(zarr_files, model, level, predictions_dir, temp_dir, input_size=512, batch_size=None, overlap=0.25, axes=(0,1,2), export_tiff=False, progress_callback=None, cancel_event=None):
 
-    project_path = Path(project_path)
+    torch.set_float32_matmul_precision('medium')
+    model.eval()
 
-    # Load model
-    model_path = Path(model_path) if model_path is not None else project_path / 'model.ckpt'
-    model, batch_size, checkpoint_num_classes = setup_model(model_path, input_size=input_size, batch_size=batch_size)
+    # predict_volume halves the batch size until it fits in memory, and returns the size that fit
+    batch_size = batch_size or input_size
 
-    if num_classes is None:
-        num_classes = checkpoint_num_classes
+    num_classes = model.num_classes
+    predictions_dir, temp_dir = Path(predictions_dir), Path(temp_dir)
 
     try:
-        # Precompute blending window for block size
-        window = gaussian_3d(input_size, sigma=0.125).astype('float32')
-
-        predictions_dir = Path(predictions_dir) if predictions_dir is not None else project_path / 'predictions'
-        temp_dir = Path(temp_dir) if temp_dir is not None else project_path / 'temp'
-
         num_volumes = len(zarr_files)
+        skipped = []
 
-        # Predict volumes
         for vol_idx, zarr_file in enumerate(zarr_files):
-            zarr_file = Path(zarr_file)
+            zarr_file = normalize_zarr_path(zarr_file)
+            prediction_file = predictions_dir / volume_folder_name(zarr_file)
+            zarr_name = prediction_file.name
+
+            if len(get_scale_paths(zarr_file)) <= level:
+                print(f'Skipping {zarr_name}: no level {level}.')
+                skipped.append(zarr_name)
+                continue
 
             if cancel_event is not None and cancel_event.is_set():
                 raise PredictionCancelled()
 
-            def volume_progress(block_idx, num_blocks, eta_seconds, vol_idx=vol_idx, name=zarr_file.name):
+            def volume_progress(block_idx, num_blocks, eta_seconds, vol_idx=vol_idx, name=zarr_name):
                 if progress_callback is not None:
                     progress_callback(name, vol_idx, num_volumes, block_idx, num_blocks, eta_seconds)
 
-            predict_volume(
+            batch_size = predict_volume(
                 zarr_file=zarr_file,
-                prediction_file=predictions_dir / zarr_file.name,
+                prediction_file=prediction_file,
                 temp_folder=temp_dir,
                 model=model,
-                window=window,
+                batch_size=batch_size,
                 input_size=input_size,
                 num_classes=num_classes,
-                batch_size=batch_size,
+                level=level,
                 overlap=overlap,
                 axes=axes,
-                tiff_folder=(predictions_dir / f'{zarr_file.stem}_tiff') if export_tiff else None,
+                tiff_folder=predictions_dir / f"{zarr_name.removesuffix('.zarr')}_tiff" if export_tiff else None,
                 progress_callback=volume_progress,
                 cancel_event=cancel_event
             )
 
+        if skipped:
+            predictions_dir.mkdir(parents=True, exist_ok=True)
+            (predictions_dir / 'skipped_volumes.txt').write_text(
+                ''.join(f'{name}: no level {level}\n' for name in skipped))
+
         print('\nAll volumes segmented.\n')
     finally:
-        # Release the prediction model from GPU memory
-        del model
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        if torch.accelerator.is_available():
+            torch.accelerator.empty_cache()
 
-
-# ----------------------------- Helper functions -----------------------------
 
 def get_padded_block(volume, i0, j0, k0, i1, j1, k1):
-    '''
-    Extracts a block from a volume with reflection padding at the boundaries.
-    '''
 
-    volume_shape = volume.shape[-3:]
-    extra_dims = volume.ndim - 3
-
-    pad_before = [max(0, -i0), max(0, -j0), max(0, -k0)]
-    pad_after  = [max(0, i1 - volume_shape[0]), max(0, j1 - volume_shape[1]), max(0, k1 - volume_shape[2])]
-
-    # Clip indices into valid range
-    c_i0, c_i1 = max(i0, 0), min(i1, volume_shape[0])
-    c_j0, c_j1 = max(j0, 0), min(j1, volume_shape[1])
-    c_k0, c_k1 = max(k0, 0), min(k1, volume_shape[2])
-
-    # Load only the needed block from the zarr volume. Extra leading dims
-    # (channel, time, ...) beyond the last 3 spatial ones are index 0.
-    block = volume[(0,) * extra_dims + (slice(c_i0, c_i1), slice(c_j0, c_j1), slice(c_k0, c_k1))]
-
-    # Pad to desired shape with reflection
-    padding = ((pad_before[0], pad_after[0]),
-               (pad_before[1], pad_after[1]),
-               (pad_before[2], pad_after[2]))
-
-    padded = np.pad(block, pad_width=padding, mode='reflect')
-
-    return padded
+    D, H, W = volume.shape
+    block = np.asarray(volume[max(i0, 0):min(i1, D), max(j0, 0):min(j1, H), max(k0, 0):min(k1, W)])
+    padding = ((max(0, -i0), max(0, i1 - D)), (max(0, -j0), max(0, j1 - H)), (max(0, -k0), max(0, k1 - W)))
+    return np.pad(block, padding, mode='reflect')
 
 def get_shard_coordinates(volume_shape, shard_size=128):
-    '''
-    Returns coordinates of all shards in the volume.
-    '''
     starts = [np.arange(0, s, shard_size) for s in volume_shape]
     chunk_coordinates = np.stack(np.meshgrid(*starts, indexing='ij'), -1).reshape(-1, 3)
     chunk_coordinates = np.concatenate([chunk_coordinates,np.minimum(chunk_coordinates + shard_size, volume_shape)], axis=1)
     return chunk_coordinates
 
-def compute_weight_map(window, block_coords, local_block_coords, region_coords):
+def resample(array, shape, mode):
+    if array.shape[-3:] == tuple(shape):
+        return array
+    tensor = torch.from_numpy(np.ascontiguousarray(array, dtype=np.float32))
+    resampled = F.interpolate(tensor.reshape((1, -1) + tensor.shape[-3:]), size=tuple(shape), mode=mode)
+    return resampled.reshape(tensor.shape[:-3] + tuple(shape)).numpy()
 
-    r_i0, r_j0, r_k0, r_i1, r_j1, r_k1 = region_coords
+def gaussian_3d(shape, sigma=0.125, eps=1e-3):
+    """Separable Gaussian blending window, clipped at eps so no voxel gets zero weight."""
 
-    weight = np.zeros((r_i1 - r_i0, r_j1 - r_j0, r_k1 - r_k0), dtype='float32')
+    g = []
+    for size in shape:
+        coords = np.arange(size, dtype=np.float32) - (size - 1) / 2.0
+        profile = np.exp(-(coords**2) / (2 * (sigma * size)**2)).astype(np.float32)
+        g.append(profile / profile.max())
 
-    for block, local in zip(block_coords, local_block_coords):
+    gaussian = g[0][:, None, None] * g[1][None, :, None] * g[2][None, None, :]
+    return np.maximum(gaussian, eps, out=gaussian)
 
-        i0, j0, k0, i1, j1, k1 = block
-        l_i0, l_j0, l_k0 = local[:3]
-
-        # Overlap between the block and the region
-        c_i0, c_i1 = max(i0, r_i0), min(i1, r_i1)
-        c_j0, c_j1 = max(j0, r_j0), min(j1, r_j1)
-        c_k0, c_k1 = max(k0, r_k0), min(k1, r_k1)
-
-        if c_i0 >= c_i1 or c_j0 >= c_j1 or c_k0 >= c_k1:
-            continue
-
-        weight[c_i0-r_i0:c_i1-r_i0, c_j0-r_j0:c_j1-r_j0, c_k0-r_k0:c_k1-r_k0] += \
-            window[c_i0-i0+l_i0:c_i1-i0+l_i0, c_j0-j0+l_j0:c_j1-j0+l_j0, c_k0-k0+l_k0:c_k1-k0+l_k0]
-
-    return weight
-
-def gaussian_3d(input_size, sigma=0.125, eps=1e-3):
+def get_block_coordinates(volume_shape, input_size=256, overlap=0.25, align=1):
     """
-    Create a 3D Gaussian window for edge weighting.
+    Overlapping blocks covering the volume, centred so the overshoot is split between both ends.
+    Returns their bounds clipped to the volume, unclipped, and the clipped bounds relative to each block's start.
     """
 
-    # Adjust sigma based on input size
-    sigma *= input_size
-
-    # 1D Gaussian
-    coords = np.arange(input_size, dtype=np.float32) - (input_size - 1) / 2.0
-    g = np.exp(-(coords**2) / (2 * sigma**2)).astype(np.float32)
-    g /= g.max()
-
-    # 3D gaussian
-    gaussian = g[:, None, None] * g[None, :, None] * g[None, None, :]
-
-    # Normalize and clip
-    gaussian /= gaussian.max()
-    gaussian = np.clip(gaussian, max(gaussian.min(), eps), 1.0)
-
-    return gaussian
-
-def get_block_coordinates(volume_shape, input_size=256, overlap=0.25):
-
-    blocks_per_axis = np.ceil((volume_shape - overlap * input_size) / (input_size - overlap * input_size)).astype(int)
+    input_size = np.broadcast_to(input_size, 3)
+    step = input_size * (1 - overlap)
+    blocks_per_axis = np.maximum(1, np.ceil((volume_shape - overlap * input_size) / step)).astype(int)
     padded_volume_shape = np.round(blocks_per_axis * input_size - (blocks_per_axis - 1) * input_size * overlap).astype(int)
 
-    padding_shift = (padded_volume_shape - volume_shape) // 2
-    padding_shift = np.array(list(padding_shift) + list(padding_shift))
+    padding_shift = (padded_volume_shape - volume_shape) // 2 // align * align
 
-    block_coords = []
-    padded_block_coords = []
-    local_block_coords = []
+    starts = np.floor(np.stack(np.meshgrid(*[np.arange(n) * s for n, s in zip(blocks_per_axis, step)], indexing='ij'), -1).reshape(-1, 3) - padding_shift).astype(int)
+    padded_block_coords = np.concatenate([starts, starts + input_size], axis=1)
 
-    for i in range(blocks_per_axis[0]):
+    block_coords = np.concatenate([np.maximum(padded_block_coords[:, :3], 0), np.minimum(padded_block_coords[:, 3:], volume_shape)], axis=1)
 
-        p_i0 = i * input_size * (1 - overlap)
-        p_i1 = p_i0 + input_size
-
-        for j in range(blocks_per_axis[1]):
-
-            p_j0 = j * input_size * (1 - overlap)
-            p_j1 = p_j0 + input_size
-
-            for k in range(blocks_per_axis[2]):
-
-                p_k0 = k * input_size * (1 - overlap)
-                p_k1 = p_k0 + input_size
-
-                # padded block coords (outside of volume range)
-                coords = np.array([p_i0, p_j0, p_k0, p_i1, p_j1, p_k1]) - padding_shift
-                coords = coords.astype(int)
-                padded_block_coords.append(coords)
-
-                # block coords (clipped to volume)
-                i0, j0, k0, i1, j1, k1 = coords
-                i0_c, i1_c = max(0, i0), min(volume_shape[0], i1)
-                j0_c, j1_c = max(0, j0), min(volume_shape[1], j1)
-                k0_c, k1_c = max(0, k0), min(volume_shape[2], k1)
-                block_coords.append([i0_c, j0_c, k0_c, i1_c, j1_c, k1_c])
-
-                # local indices within block
-                l_i0, l_i1 = i0_c - i0, i1_c - i0
-                l_j0, l_j1 = j0_c - j0, j1_c - j0
-                l_k0, l_k1 = k0_c - k0, k1_c - k0
-                local_block_coords.append([l_i0, l_j0, l_k0, l_i1, l_j1, l_k1])
-
-    padded_block_coords = np.array(padded_block_coords)
-    block_coords = np.array(block_coords)
-    local_block_coords = np.array(local_block_coords)
+    local_block_coords = block_coords - np.tile(padded_block_coords[:, :3], 2)
 
     return block_coords, padded_block_coords, local_block_coords

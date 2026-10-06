@@ -1,143 +1,113 @@
 import asyncio
 import time
+import logging
 import threading
 import concurrent.futures
-from dataclasses import dataclass
+from collections import deque
 from typing import Any, Awaitable, Callable, Optional, Literal
 from functools import partial
 
 AsyncFn = Callable[..., Awaitable[None]]
 SyncFn = Callable[..., None]
-Mode = Literal["latest", "drop"]
+Mode = Literal["latest", "drop", "queue"]
 
-
-@dataclass
-class JobSpec:
-    max_hz: Optional[float] = None
-    idle_after: Optional[float] = None
-    idle_args: tuple[Any, ...] = ()
-    idle_kwargs: Optional[dict[str, Any]] = None
-
-    mode: Mode = "latest"
-
-    executor: Optional[concurrent.futures.Executor] = None
-    sequential_executor: bool = True
-    idle_gen_guard: bool = True
+log = logging.getLogger(__name__)
 
 
 class JobScheduler:
-    """
-    Thread-safe scheduler:
-    - request() may be called from worker threads.
-    - internal asyncio tasks are always created on the scheduler's event loop thread.
-    """
+    """Named, rate-limited jobs on the asyncio loop it is created on. request() and call_soon() are thread-safe."""
 
-    def __init__(self, *, default_workers: int = 2, loop: Optional[asyncio.AbstractEventLoop] = None):
-        # IMPORTANT: this must run on the asyncio thread (or pass loop explicitly)
-        if loop is None:
-            loop = asyncio.get_running_loop()
-
-        self.loop = loop
+    def __init__(self):
+        self.loop = asyncio.get_running_loop()
         self._loop_thread_id = threading.get_ident()
 
-        self._default_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=default_workers
-        )
         self.jobs: dict[str, Job] = {}
 
-    def register_async(self, name: str, fn: AsyncFn, *, spec: JobSpec) -> None:
-        self.jobs[name] = Job(fn, spec, loop=self.loop, loop_thread_id=self._loop_thread_id)
+    def register_async(self, name: str, fn: AsyncFn, **spec) -> None:
+        self.jobs[name] = Job(name, fn, loop=self.loop, loop_thread_id=self._loop_thread_id, **spec)
 
-    def register_sync(self, name: str, fn: SyncFn, *, spec: JobSpec) -> None:
-        executor = spec.executor
-        owned_executor = None
-        if executor is None and spec.sequential_executor:
-            executor = owned_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        if executor is None:
-            executor = self._default_executor
+    def register_sync(self, name: str, fn: SyncFn, executor: Optional[concurrent.futures.Executor] = None, **spec) -> None:
+        executor = executor or concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
         async def wrapper(*args, **kwargs):
             loop = asyncio.get_running_loop()
-            # run_in_executor does NOT accept **kwargs; bind them first
             await loop.run_in_executor(executor, partial(fn, *args, **kwargs))
 
         self.jobs[name] = Job(
-            wrapper, spec,
+            name, wrapper,
             loop=self.loop, loop_thread_id=self._loop_thread_id,
-            owned_executor=owned_executor,
+            executor=executor, **spec,
         )
 
     def request(self, name: str, *args, **kwargs) -> None:
-        """
-        Safe to call from any thread.
-        If called off the event loop thread, it forwards the request to the loop thread.
-        """
-        try:
-            job = self.jobs[name]
-        except KeyError as e:
-            raise KeyError(f"Unknown job '{name}'. Registered: {list(self.jobs)}") from e
+        job = self.jobs[name]
 
-        # If we're not on the loop thread, bounce to the loop thread
         if threading.get_ident() != self._loop_thread_id:
             self.loop.call_soon_threadsafe(job.request, *args, **kwargs)
             return
 
         job.request(*args, **kwargs)
 
-    def unregister(self, name: str) -> None:
-        job = self.jobs.pop(name, None)
-        if job:
-            job.shutdown()
+    def call_soon(self, fn: Callable[..., Any], *args, **kwargs) -> None:
+        if threading.get_ident() == self._loop_thread_id:
+            fn(*args, **kwargs)
+        else:
+            self.loop.call_soon_threadsafe(partial(fn, *args, **kwargs))
 
     def shutdown(self) -> None:
         for job in self.jobs.values():
             job.shutdown()
-        self._default_executor.shutdown(wait=False)
 
 
 class Job:
+    """
+    Runs `fn` on the loop, one call at a time and at most `max_hz` times per second.
+    mode: 'latest' keeps only the newest pending request, 'drop' ignores requests while busy, 'queue' runs them all.
+    idle_after: once requests stop for this many seconds, `fn` runs once more with `idle_kwargs`.
+    """
     def __init__(
-        self, fn: AsyncFn, spec: JobSpec, *,
+        self, name: str, fn: AsyncFn, *,
         loop: asyncio.AbstractEventLoop, loop_thread_id: int,
-        owned_executor: Optional[concurrent.futures.Executor] = None,
+        executor: Optional[concurrent.futures.Executor] = None,
+        max_hz: Optional[float] = None, mode: Mode = "latest",
+        idle_after: Optional[float] = None, idle_kwargs: Optional[dict[str, Any]] = None,
     ):
+        self.name = name
         self.fn = fn
         self.loop = loop
         self._loop_thread_id = loop_thread_id
 
-        self._owned_executor = owned_executor
+        self._executor = executor
 
-        self.mode = spec.mode
-        self.min_interval = (1.0 / spec.max_hz) if spec.max_hz else 0.0
+        self.mode = mode
+        self.min_interval = (1.0 / max_hz) if max_hz else 0.0
 
-        self.idle_after = spec.idle_after
-        self.idle_args = spec.idle_args
-        self.idle_kwargs = spec.idle_kwargs or {}
-        self.idle_gen_guard = bool(spec.idle_gen_guard)
+        self.idle_after = idle_after
+        self.idle_kwargs = idle_kwargs or {}
 
-        self._latest: Optional[tuple[tuple[Any, ...], dict[str, Any]]] = None
+        self._pending: deque[tuple[tuple[Any, ...], dict[str, Any]]] = deque()
 
         self._drain_task: Optional[asyncio.Task] = None
         self._idle_task: Optional[asyncio.Task] = None
 
         self._busy = False
+        self._closed = False
         self._last_start = 0.0
-        self._gen = 0  # bumps on every request
 
     def request(self, *args, **kwargs) -> None:
-        """
-        MUST be executed on the loop thread.
-        (Scheduler.request ensures this by forwarding across threads.)
-        """
-        self._gen += 1
-
-        if self.mode == "drop" and (self._busy or self._has_pending()):
+        if self._closed or (self.mode == "drop" and (self._busy or self._pending)):
             return
 
-        self._latest = (args, kwargs)
+        if self.mode == "latest":
+            self._pending.clear()
+        self._pending.append((args, kwargs))
 
         self._ensure_drain()
-        self._arm_idle(self._gen)
+        self._arm_idle()
+
+    @property
+    def pending(self) -> int:
+        return len(self._pending)
 
     def cancel(self) -> None:
         if threading.get_ident() != self._loop_thread_id:
@@ -148,33 +118,22 @@ class Job:
             self._drain_task.cancel()
         if self._idle_task:
             self._idle_task.cancel()
-        self._latest = None
+        self._pending.clear()
 
     def shutdown(self) -> None:
+        self._closed = True
         self.cancel()
-        if self._owned_executor is not None:
-            self._owned_executor.shutdown(wait=False, cancel_futures=True)
-
-    def _has_pending(self) -> bool:
-        return self._latest is not None
-
-    def _pop_next(self):
-        item = self._latest
-        self._latest = None
-        return item
+        if self._executor is not None:
+            self._executor.shutdown(wait=False, cancel_futures=True)
 
     def _ensure_drain(self) -> None:
-        # Always create tasks on the scheduler's loop (not "current thread loop")
         if self._drain_task is None or self._drain_task.done():
             self._drain_task = self.loop.create_task(self._drain())
 
     async def _drain(self) -> None:
-        while True:
-            item = self._pop_next()
-            if item is None:
-                return
+        while self._pending:
+            args, kwargs = self._pending.popleft()
 
-            # throttle
             if self.min_interval:
                 now = time.time()
                 wait = (self._last_start + self.min_interval) - now
@@ -184,12 +143,13 @@ class Job:
             self._busy = True
             self._last_start = time.time()
             try:
-                args, kwargs = item
                 await self.fn(*args, **kwargs)
+            except Exception:
+                log.exception("Job '%s' failed", self.name)
             finally:
                 self._busy = False
 
-    def _arm_idle(self, gen: int) -> None:
+    def _arm_idle(self) -> None:
         if not self.idle_after:
             return
 
@@ -200,14 +160,11 @@ class Job:
             try:
                 await asyncio.sleep(self.idle_after)
 
-                if self.idle_gen_guard and gen != self._gen:
-                    return
-
-                # only fire if truly quiet
-                if not self._busy and not self._has_pending():
-                    await self.fn(*self.idle_args, **self.idle_kwargs)
+                if not self._busy and not self._pending:
+                    await self.fn(**self.idle_kwargs)
             except asyncio.CancelledError:
                 pass
+            except Exception:
+                log.exception("Job '%s' failed", self.name)
 
-        # Always create tasks on the scheduler's loop
         self._idle_task = self.loop.create_task(idle())

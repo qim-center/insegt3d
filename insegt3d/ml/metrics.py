@@ -1,160 +1,61 @@
 import torch
+import torch.nn.functional as F
 
-def _weighted_mean(values, weight, axes):
+AXES = (0, 2, 3)
+EPSILON = 1e-12
+
+def scnp(logits, y_true, weight, neighborhood_size=3):
     """
-    Sums `values` over `axes` and divides by the count of contributing pixels
-    there -- the sum of `weight` if given, or the plain pixel count along
-    `axes` otherwise.
-    """
-
-    if weight is not None:
-        values = weight * values
-        counts = torch.sum(weight, axis=axes)
-    else:
-        counts = 1
-        for axis in axes:
-            counts *= values.shape[axis]
-
-    return torch.sum(values, axis=axes) / counts
-
-def crossentropy_loss(y_pred, y_true, weight=None, axes=(2,3)):
-    """
-    Computes the crossentropy loss along the given axes and then
-    takes the mean across the remaining axes.
+    Same Class Neighbor Penalization: replaces each logit by the worst logit among its
+    same-class neighbours. `weight` limits this to fully annotated neighbourhoods.
+    See https://jmlipman.github.io/SCNP-SameClassNeighborPenalization/
     """
 
-    epsilon = 1e-12
+    kernel = (neighborhood_size, neighborhood_size)
+    stride = (1, 1)
+    padding = (neighborhood_size // 2, neighborhood_size // 2)
 
-    ce = -_weighted_mean(y_true * torch.log(y_pred + epsilon), weight, axes)
+    foreground = -F.max_pool2d(-(logits * y_true + 9999 * (1 - y_true)), kernel, stride, padding)
+    background = F.max_pool2d(logits * (1 - y_true) - 9999 * y_true, kernel, stride, padding)
 
-    return torch.mean(ce)
+    penalized = foreground * y_true + background * (1 - y_true)
 
-def dice(y_pred, y_true, weight=None, axes=(2,3)):
-    """
-    Computes the dice score along the given axes and then
-    takes the mean across the remaining axes.
-    """
+    annotated = -F.max_pool2d(-weight, kernel, stride, padding)
+    return penalized * annotated + logits * (1 - annotated)
 
-    epsilon = 1e-12
+def _weighted_mean(values, weight):
+    return torch.sum(weight * values, axis=AXES) / torch.sum(weight, axis=AXES)
 
-    # Compute confusion matrix percentages
-    tp = true_positives(y_pred, y_true, weight, axes)
-    fp = false_positives(y_pred, y_true, weight, axes)
-    fn = false_negatives(y_pred, y_true, weight, axes)
+def _confusion(y_pred, y_true, weight):
+    tp = _weighted_mean(y_true * y_pred, weight)
+    fp = _weighted_mean((1 - y_true) * y_pred, weight)
+    fn = _weighted_mean((1 - y_pred) * y_true, weight)
+    tn = _weighted_mean((1 - y_pred) * (1 - y_true), weight)
+    return tp, fp, fn, tn
 
-    num = 2 * tp
-    den = 2 * tp + fp + fn
-    dice_score = (num + epsilon) / (den + epsilon)
+def crossentropy_loss(y_pred, y_true, weight):
+    return torch.mean(-_weighted_mean(y_true * torch.log(y_pred + EPSILON), weight))
 
-    return torch.mean(dice_score)
+def dice_loss(y_pred, y_true, weight):
+    tp, fp, fn, _ = _confusion(y_pred, y_true, weight)
+    return 1 - torch.mean((2 * tp + EPSILON) / (2 * tp + fp + fn + EPSILON))
 
-def dice_loss(y_pred, y_true, weight=None, axes=(2,3)):
-    """
-    Computes the dice loss.
-    """
-
-    return 1 - dice(y_pred, y_true, weight, axes)
-
-def iou(y_pred, y_true, weight=None, axes=(2,3)):
-    """
-    Computes the intersection over union (Jaccard index) along the given axes and then
-    takes the mean across the remaining axes.
-    """
-
-    epsilon = 1e-12
-
-    # Compute confusion matrix percentages
-    tp = true_positives(y_pred, y_true, weight, axes)
-    fp = false_positives(y_pred, y_true, weight, axes)
-    fn = false_negatives(y_pred, y_true, weight, axes)
-
-    num = tp
-    den = tp + fp + fn
-    iou_score = (num + epsilon) / (den + epsilon)
-
-    return torch.mean(iou_score)
-
-def iou_loss(y_pred, y_true, weight=None, axes=(2,3)):
-    """
-    Computes the intersection over union (Jaccard index) loss.
-    """
-
-    return 1 - iou(y_pred, y_true, weight, axes)
-
-
-def mcc(y_pred, y_true, weight=None, axes=(2,3)):
-    """
-    Computes the Mathews correlation coefficient (mcc) along the given axes and then
-    takes the mean across the remaining axes.
-    """
-
-    epsilon = 1e-12
-
-    # Compute confusion matrix percentages
-    tp = true_positives(y_pred, y_true, weight, axes)
-    tn = true_negatives(y_pred, y_true, weight, axes)
-    fp = false_positives(y_pred, y_true, weight, axes)
-    fn = false_negatives(y_pred, y_true, weight, axes)
-
-    # MCC computation
+def mcc_loss(y_pred, y_true, weight):
+    tp, fp, fn, tn = _confusion(y_pred, y_true, weight)
     num = (tp * tn) - (fp * fn)
     den = ((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn))**0.5
-    mcc_score = (num + epsilon) / (den + epsilon)
+    return 1 - torch.mean((num + EPSILON) / (den + EPSILON))
 
-    return torch.mean(mcc_score)
+def dice_ce_loss(y_pred, y_true, weight):
+    return dice_loss(y_pred, y_true, weight) + crossentropy_loss(y_pred, y_true, weight)
 
-def mcc_loss(y_pred, y_true, weight=None, axes=(2,3)):
-    """
-    Computes the Mathews correlation coefficient (mcc) loss.
-    """
+def mcc_ce_loss(y_pred, y_true, weight):
+    return mcc_loss(y_pred, y_true, weight) + crossentropy_loss(y_pred, y_true, weight)
 
-    return 1 - mcc(y_pred, y_true, weight, axes)
-
-def true_positives(y_pred, y_true, weight=None, axes=(2,3)):
-    """
-    Computes percentage of true positives along the given axes.
-    """
-
-    return _weighted_mean(y_true * y_pred, weight, axes)
-
-def true_negatives(y_pred, y_true, weight=None, axes=(2,3)):
-    """
-    Computes percentage of true negatives along the given axes.
-    """
-
-    return _weighted_mean((1 - y_pred) * (1 - y_true), weight, axes)
-
-def false_positives(y_pred, y_true, weight=None, axes=(2,3)):
-    """
-    Computes percentage of false positives along the given axes.
-    """
-
-    return _weighted_mean((1 - y_true) * y_pred, weight, axes)
-
-def false_negatives(y_pred, y_true, weight=None, axes=(2,3)):
-    """
-    Computes percentage of false negatives along the given axes.
-    """
-
-    return _weighted_mean((1 - y_pred) * y_true, weight, axes)
-
-def dice_ce_loss(y_pred, y_true, weight=None, axes=(2,3)):
-    """
-    Computes the combined Dice and crossentropy loss.
-    """
-
-    return dice_loss(y_pred, y_true, weight, axes) + crossentropy_loss(y_pred, y_true, weight, axes)
-
-def iou_ce_loss(y_pred, y_true, weight=None, axes=(2,3)):
-    """
-    Computes the combined intersection over union (Jaccard index) and crossentropy loss.
-    """
-
-    return iou_loss(y_pred, y_true, weight, axes) + crossentropy_loss(y_pred, y_true, weight, axes)
-
-def mcc_ce_loss(y_pred, y_true, weight=None, axes=(2,3)):
-    """
-    Computes the combined Mathews correlation coefficient (mcc) and crossentropy loss.
-    """
-
-    return mcc_loss(y_pred, y_true, weight, axes) + crossentropy_loss(y_pred, y_true, weight, axes)
+LOSS_OPTIONS = {
+    crossentropy_loss: 'CE',
+    dice_loss: 'Dice',
+    mcc_loss: 'MCC',
+    dice_ce_loss: 'Dice+CE',
+    mcc_ce_loss: 'MCC+CE',
+}

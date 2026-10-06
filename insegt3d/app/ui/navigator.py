@@ -1,8 +1,6 @@
 import json
 import numpy as np
 from nicegui import ui
-from concurrent.futures import ThreadPoolExecutor
-from insegt3d.app.scheduler import JobSpec
 
 EPS = 1e-9
 PI = np.pi
@@ -18,17 +16,12 @@ def wrap_pi(a):
 
 
 def basis_R(*columns):
-    """
-    Rotation matrix mapping the local x, y, z axes onto the given columns.
-    """
+    """Rotation matrix mapping the local x, y, z axes onto the given columns."""
     return np.stack([np.asarray(c, float) for c in columns], axis=1).tolist()
 
 
 def frame_from_direction(d):
-    """
-    An orthonormal frame whose local +y axis points along d (arrows are modelled
-    along +y).
-    """
+    """Orthonormal frame whose local +y axis points along d (arrows are modelled along +y)."""
     d = unit(d)
     zref = np.array([0, 0, 1]) if abs(d @ [0, 0, 1]) < 0.99 else np.array([1, 0, 0])
     x = unit(np.cross(d, zref))
@@ -36,57 +29,19 @@ def frame_from_direction(d):
     return basis_R(x, d, z)
 
 
-def Rx(theta: float) -> np.ndarray:
-    """
-    Rotation matrix around +X
-    """
-    c, s = float(np.cos(theta)), float(np.sin(theta))
-    return np.array([[1.0, 0.0, 0.0],
-                     [0.0,   c,  -s],
-                     [0.0,   s,   c]], float)
-
-
-def add_wire_box(scene, size_xyz, color="#aaaaaa"):
-    """
-    Create a wireframe box that represents the volume
-    """
-    sx, sy, sz = map(float, size_xyz)
-    hx, hy, hz = sx / 2, sy / 2, sz / 2
-
-    pts = np.array(
-        [
-            [-hx, -hy, -hz], [hx, -hy, -hz],
-            [-hx,  hy, -hz], [hx,  hy, -hz],
-            [-hx, -hy,  hz], [hx, -hy,  hz],
-            [-hx,  hy,  hz], [hx,  hy,  hz],
-        ]
-    )
-    edges = [
-        (0, 1), (0, 2), (2, 3), (1, 3),
-        (4, 5), (4, 6), (6, 7), (5, 7),
-        (0, 4), (1, 5), (2, 6), (3, 7),
-    ]
-
-    with scene.group() as group:
-        for i, j in edges:
-            ui.scene.line(tuple(pts[i]), tuple(pts[j])).material(color)
-
-    return group
-
-
 class NavigatorWidget:
 
-    def __init__(self, state, axis_len=1.0, ring_scale=1.3):
+    def __init__(self, state, scheduler, axis_len=1.0, ring_scale=1.3):
 
         self.camera = state.camera
         self.nav = state.nav
 
-        self._sync_exec = ThreadPoolExecutor(max_workers=1)
+        self.scheduler = scheduler
 
         self.axis_len = float(axis_len)
         self.ring_radius = self.axis_len * float(ring_scale)
 
-        self.W2S = Rx(+PI / 2)
+        self.W2S = np.array([[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]])
         self.S2W = self.W2S.T
 
         self.volume_shape = None
@@ -127,19 +82,7 @@ class NavigatorWidget:
         ui.timer(0.1, self._enable_touch_orbit, once=True)
         ui.timer(0.1, self._install_gizmo_drag, once=True)
 
-    def initialize(self, volume_shape, scheduler):
-
-        self.scheduler = scheduler
-        self.scheduler.register_sync(
-            "sync_navigator",
-            fn=self._sync,
-            spec=JobSpec(
-                max_hz=30,
-                mode="latest",
-                executor=self._sync_exec,
-                sequential_executor=False,
-            ),
-        )
+    def initialize(self, volume_shape):
 
         self.volume_shape = np.asarray(volume_shape, float)
         self.volume_center = self.volume_shape / 2
@@ -149,16 +92,12 @@ class NavigatorWidget:
             self._wire_box.delete()
             self._wire_box = None
 
-        self._wire_box = add_wire_box(
-            self.scene,
-            self.volume_shape * self.world_to_scene_scale,
-        )
+        size = (self.volume_shape * self.world_to_scene_scale).tolist()
+        with self.scene:
+            self._wire_box = ui.scene.box(*size, wireframe=True).material("#aaaaaa")
 
         self._last_plane_dims = None
-        self._sync()
-
-    def close(self):
-        self._sync_exec.shutdown(wait=False, cancel_futures=True)
+        self.sync()
 
     def _enable_touch_orbit(self):
         ui.run_javascript(f"""
@@ -193,8 +132,7 @@ class NavigatorWidget:
           if (el.__insegt3d_gizmo_installed) return;
           el.__insegt3d_gizmo_installed = true;
 
-          // Handles are nested in the gizmo group now; without this DragControls
-          // would select the outermost group and we could not tell them apart.
+          // Drag the picked handle itself rather than the outermost group, so handles can be told apart
           el.drag_controls.transformGroup = false;
 
           const handles = {json.dumps(handles)};
@@ -208,9 +146,7 @@ class NavigatorWidget:
             return null;
           }};
 
-          // DragControls froze the parent matrix at grab time; using the same
-          // matrix recovers the raw pointer position without folding in any
-          // gizmo motion that happened since.
+          // Use the parent matrix frozen at grab time, so gizmo motion since then is not read as pointer motion
           const report = (phase, object) => {{
             const p = object.position.clone().applyMatrix4(frozen);
             emitEvent(event_name, {{phase: phase, handle: key, x: p.x, y: p.y, z: p.z}});
@@ -246,38 +182,20 @@ class NavigatorWidget:
         """)
 
     def _to_scene(self, p):
-        if self.world_to_scene_scale is None:
-            return np.zeros(3)
         q = (np.asarray(p, float) - self.volume_center)
         q = self.W2S @ q
         return q * self.world_to_scene_scale
 
     def _scene_axes(self):
-        """
-        The camera's u, v, w basis expressed in scene coordinates.
-        """
         return tuple(self.W2S @ np.asarray(axis, float) for axis in self.camera.uvw)
 
     def _to_world_delta(self, d):
-        if self.world_to_scene_scale is None:
-            return np.zeros(3)
         q = np.asarray(d, float) / self.world_to_scene_scale
         return self.S2W @ q
 
     def _ring(self, plane, color, steps=72):
-        r = self.ring_radius
-        axes = {
-            "yz": (np.array([0, 1, 0]), np.array([0, 0, 1])),
-            "xz": (np.array([1, 0, 0]), np.array([0, 0, 1])),
-            "xy": (np.array([1, 0, 0]), np.array([0, 1, 0])),
-        }
-        a, b = axes[plane]
-        ts = np.linspace(0, 2 * PI, steps + 1)
-        for t0, t1 in zip(ts[:-1], ts[1:]):
-            ui.scene.line(
-                tuple(r * (np.cos(t0) * a + np.sin(t0) * b)),
-                tuple(r * (np.cos(t1) * a + np.sin(t1) * b)),
-            ).material(color)
+        rotation = {"yz": (0, PI / 2, 0), "xz": (PI / 2, 0, 0), "xy": (0, 0, 0)}[plane]
+        ui.scene.ring(0.995 * self.ring_radius, self.ring_radius, steps, wireframe=True).rotate(*rotation).material(color)
 
     def _arrow(self, color, direction):
         shaft_radius = 1.5 * 0.02 * self.axis_len
@@ -292,7 +210,7 @@ class NavigatorWidget:
 
         return group.rotate_R(frame_from_direction(direction)).draggable()
 
-    def _sync(self, *_):
+    def sync(self):
         if self.volume_shape is None:
             return
 
@@ -318,7 +236,7 @@ class NavigatorWidget:
 
         if phase == "end":
             self._drag_pos.pop(key, None)
-            self._sync()
+            self.sync()
             if self.volume_shape is not None:
                 self.scheduler.request("nav_hires")
             return
@@ -340,6 +258,7 @@ class NavigatorWidget:
         if self.volume_shape is None:
             return
 
+        # pan and scroll scale by zoom, so divide it out to make the plane follow the handle
         d = self._to_world_delta(p1 - p0) / float(self.camera.zoom)
 
         u, v, w = self.camera.uvw
@@ -356,7 +275,7 @@ class NavigatorWidget:
                 axis, wrap_pi(self._ring_angle(axis, p1) - self._ring_angle(axis, p0))
             )
 
-        self._sync()
+        self.sync()
         self.scheduler.request("nav_preview")
 
     def _ring_angle(self, axis, p):

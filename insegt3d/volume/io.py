@@ -1,20 +1,20 @@
+import math
 import zarr
+import base64
+import hashlib
 import tensorstore as ts
 
 import numpy as np
 import tifffile as tiff
 from pathlib import Path
-from scipy.ndimage import zoom
 from urllib.parse import urlparse
 
-# Axis order required by OME-Zarr 0.5: time, channel, then the spatial axes.
+# Axis order required by OME-Zarr 0.5: time, channel, then the spatial axes
 OME_AXES = ('t', 'c', 'z', 'y', 'x')
 MAX_NDIM = len(OME_AXES)
 
-# OME-Zarr axis "type" for each axis name
 _AXIS_TYPES = {'t': 'time', 'c': 'channel'}
 
-# Annotation masks are always uint8
 MASK_DTYPE = 'uint8'
 
 def default_axes(ndim):
@@ -24,6 +24,7 @@ def default_axes(ndim):
     return OME_AXES[MAX_NDIM - ndim:]
 
 def transpose_order(input_axes, ndim, source=''):
+    """Permutation that reorders `input_axes` into OME-Zarr order (identity if None)."""
     axes = default_axes(ndim)
 
     if input_axes is None:
@@ -34,26 +35,74 @@ def transpose_order(input_axes, ndim, source=''):
     if len(input_axes) != ndim or set(input_axes) != set(axes):
         raise ValueError(
             f"input_axes {input_axes} do not describe the {ndim} dimensions of "
-            f"'{source}'; expected a permutation of {axes}")
+            f"'{source}'. Expected a permutation of {axes}")
 
     return tuple(input_axes.index(axis) for axis in axes)
 
 def normalize_zarr_path(zarr_path):
     return str(zarr_path).strip().rstrip('/')
 
-def get_zarr_group(zarr_path):
-    zarr_path = normalize_zarr_path(zarr_path)
+def make_ts_context(cache_size_mb=4096):
+    return ts.Context({
+        'cache_pool': {'total_bytes_limit': int(cache_size_mb * 1024**2)},
+        'http_request_concurrency': {'limit': 32}
+    })
 
-    if zarr_path.startswith(("http://", "https://")):
-        store = zarr_path
-    else:
-        store = zarr.storage.LocalStore(zarr_path)
-    return zarr.open_group(store=store, mode='r')
+def is_http_url(zarr_path):
+    return urlparse(normalize_zarr_path(zarr_path)).scheme in ("http", "https")
+
+def url_id(url, length=10):
+    digest = hashlib.sha256(url.encode("utf-8")).digest()
+    token = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+    return token[:length]
+
+def volume_folder_name(zarr_ref):
+    """<stem>__<hash> for local paths and <last URL component>__<hash> for URLs, unique per location."""
+    zarr_ref = normalize_zarr_path(zarr_ref)
+
+    if is_http_url(zarr_ref):
+        last = urlparse(zarr_ref).path.rstrip("/").split("/")[-1] or "remote"
+        return f"{last}__{url_id(zarr_ref)}"
+
+    path = Path(zarr_ref).resolve()
+    return f"{path.stem}__{url_id(str(path))}"
+
+def resolve_zarr_inputs(data_path):
+    """Zarr volumes in data_path: a single store, every store in a folder, or comma-separated http(s) URLs."""
+    data_path = str(data_path).strip()
+    if not data_path:
+        raise ValueError("Enter a path or URL to load.")
+
+    parts = [p.strip() for p in data_path.split(",") if p.strip()]
+    if parts and all(is_http_url(p) for p in parts):
+        return parts
+    if len(parts) > 1:
+        raise ValueError("All comma-separated paths must be http(s) URLs.")
+
+    path = Path(data_path).expanduser().resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"Data path not found: {data_path}")
+    if not path.is_dir():
+        raise ValueError(f"Data path must be a zarr directory, a folder of zarrs, or an http(s) URL: {data_path}")
+
+    if is_multiscale_zarr(path):
+        return [str(path)]
+
+    zarr_files = [
+        str(sub) for sub in sorted(path.iterdir())
+        if sub.is_dir() and is_multiscale_zarr(sub)
+    ]
+
+    if not zarr_files:
+        raise ValueError(f"No zarr volumes found under {data_path}")
+
+    return zarr_files
+
+def get_multiscale(zarr_path):
+    return zarr.open_group(normalize_zarr_path(zarr_path), mode='r').attrs['ome']['multiscales'][0]
 
 def get_scale_paths(zarr_path):
-    root = get_zarr_group(zarr_path)
-    multiscales = root.attrs['ome']['multiscales']
-    return [dataset['path'] for dataset in multiscales[0]['datasets']]
+    return [dataset['path'] for dataset in get_multiscale(zarr_path)['datasets']]
 
 def is_multiscale_zarr(zarr_path):
     zarr_path = Path(zarr_path)
@@ -68,37 +117,34 @@ def is_multiscale_zarr(zarr_path):
 
     return True
 
-def create_empty_zarr(zarr_path, level_shapes, chunks=(64,64,64), shards=(256,256,256), dtype=MASK_DTYPE, scale=0.5):
+def _create_array(root, name, shape, dtype, chunks, shards=None):
+    extra_dims = len(shape) - 3
+    return root.create_array(
+        name=name,
+        shape=shape,
+        chunks=(1,) * extra_dims + tuple(chunks),
+        shards=(1,) * extra_dims + tuple(shards) if shards else None,
+        dtype=dtype,
+        dimension_names=default_axes(len(shape)),
+        overwrite=True)
+
+def create_empty_zarr(zarr_path, level_shapes, scales, translations, chunks=(64,64,64), shards=(256,256,256), dtype=MASK_DTYPE):
 
     root = zarr.open(zarr_path, mode='w')
 
-    axes = default_axes(len(level_shapes[0]))
-    extra_dims = len(axes) - 3
-
     for i, shape in enumerate(level_shapes):
-        root.create_array(
-            name=str(i),
-            shape=shape,
-            chunks=(1,) * extra_dims + tuple(chunks),
-            shards=(1,) * extra_dims + tuple(shards),
-            dtype=dtype,
-            dimension_names=axes,
-            overwrite=True)
+        _create_array(root, str(i), shape, dtype, chunks, shards)
 
-    write_multiscale_metadata(
-        root, num_levels=len(level_shapes), scale=scale, name=Path(zarr_path).stem)
+    write_multiscale_metadata(root, scales, translations, name=Path(zarr_path).stem)
 
-def read_zarr_as_tensorstore(zarr_path, ts_context=None, cache_size_mb=4096):
+def read_zarr_as_tensorstore(zarr_path, axes=None, ts_context=None, cache_size_mb=4096, recheck=False):
 
     zarr_path = normalize_zarr_path(zarr_path)
 
     if ts_context is None:
-        ts_context = ts.Context({
-            'cache_pool': {'total_bytes_limit': int(cache_size_mb * 1024**2)}
-        })
+        ts_context = make_ts_context(cache_size_mb)
 
-    # Build kvstore (local or http)
-    if zarr_path.startswith(("http://", "https://")):
+    if is_http_url(zarr_path):
         u = urlparse(zarr_path)
         kvstore = {
             "driver": "http",
@@ -114,89 +160,89 @@ def read_zarr_as_tensorstore(zarr_path, ts_context=None, cache_size_mb=4096):
     data = ts.open({
         "driver": "zarr3",
         "kvstore": kvstore,
-        "recheck_cached_data": False,
+        "recheck_cached_data": recheck,
     }, context=ts_context).result()
 
     if data.ndim < 3:
         raise ValueError(f"Expected at least 3D data, got shape {data.shape}")
 
+    if axes is not None:
+        data = data.transpose(transpose_order(axes, data.ndim, source=zarr_path))
+
+    # 4D/5D volumes show their first timepoint and channel
     return data[(0,) * (data.ndim - 3) + (slice(None),) * 3]
 
-def read_multiscale_zarr(zarr_path, ts_context=None, cache_size_mb=4096):
+def read_multiscale_zarr(zarr_path, ts_context=None, cache_size_mb=4096, recheck=False):
 
     zarr_path = normalize_zarr_path(zarr_path)
 
-    # Get per-level dataset paths in the multiscale zarr, finest to coarsest
-    levels = get_scale_paths(zarr_path)
+    multiscale = get_multiscale(zarr_path)
+    axes = tuple(str(axis['name']).lower() for axis in multiscale['axes'])
+    spatial = list(transpose_order(axes, len(axes))[-3:])
 
-    images = []
+    images, scales, translations = [], [], []
+    for dataset in multiscale['datasets']:
+        images.append(read_zarr_as_tensorstore(f"{zarr_path}/{dataset['path']}", axes=axes, ts_context=ts_context, cache_size_mb=cache_size_mb, recheck=recheck))
+        scale, translation = _scale_translation(dataset['coordinateTransformations'] + multiscale.get('coordinateTransformations', []), len(axes))
+        scales.append(scale[spatial])
+        translations.append(translation[spatial])
 
-    # Create multiscale image list
-    for level in levels:
-        path = f"{zarr_path}/{level}"
-        image = read_zarr_as_tensorstore(path, ts_context=ts_context, cache_size_mb=cache_size_mb)
-        images.append(image)
+    return images, np.array(scales), np.array(translations)
 
-    return images
+def _scale_translation(transformations, ndim):
+    scale, translation = np.ones(ndim), np.zeros(ndim)
+    for transformation in transformations:
+        if transformation['type'] == 'scale':
+            scale, translation = scale * transformation['scale'], translation * transformation['scale']
+        elif transformation['type'] == 'translation':
+            translation = translation + transformation['translation']
+    return scale, translation
 
-def read_multiscale_masks(mask_path, level_shapes, ts_context=None):
+def read_multiscale_masks(mask_path, level_shapes, scales, translations, ts_context=None):
 
     mask_path = Path(mask_path)
 
-    # Ensure masks folder exists
     mask_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Create mask Zarr if it doesn't exist.
     if not mask_path.exists():
         create_empty_zarr(
             zarr_path=str(mask_path),
             level_shapes=level_shapes,
+            scales=scales,
+            translations=translations,
             dtype=MASK_DTYPE)
 
-    # Create multiscale mask list
-    masks = []
-    for level in range(len(level_shapes)):
-        path = str(mask_path / str(level))
-        mask = read_zarr_as_tensorstore(path, ts_context=ts_context)
-        masks.append(mask)
+    return [
+        read_zarr_as_tensorstore(str(mask_path / str(level)), ts_context=ts_context, recheck="open")
+        for level in range(len(level_shapes))
+    ]
 
-    return masks
+def remap_labels(root, lut):
+    # Every level of every mask under root, rewriting only the shards that exist on disk
+    for level in Path(root).glob('*/[0-9]*'):
+        array = zarr.open_array(str(level), mode='r+')
+        for shard in level.glob('c/*/*/*'):
+            index = map(int, shard.relative_to(level / 'c').parts)
+            box = tuple(slice(i * n, (i + 1) * n) for i, n in zip(index, array.shards))
+            array[box] = lut[array[box]]
 
-def write_level0_array(dst_file, shape, dtype, chunks, shards):
-
-    axes = default_axes(len(shape))
-
-    extra_dims = len(shape) - 3
-    full_chunks = (1,) * extra_dims + tuple(chunks)
-    full_shards = (1,) * extra_dims + tuple(shards)
-
+def write_level0_array(dst_file, shape, dtype, chunks, shards=None):
     root = zarr.open(dst_file, mode='w')
-    z0 = root.create_array(
-        name='0',
-        shape=shape,
-        chunks=full_chunks,
-        shards=full_shards,
-        dtype=dtype,
-        dimension_names=axes,
-        overwrite=True)
-    return root, z0
+    return root, _create_array(root, '0', shape, dtype, chunks, shards)
 
-def write_zarr(volume, dst_file, dtype=None, multiscale=True, scale=0.5, chunks=(64,64,64), shards=(256,256,256), mem_limit_gb=4):
+def write_zarr(volume, dst_file, dtype=None, multiscale=True, voxel_size=(1.0, 1.0, 1.0), chunks=(64,64,64), shards=(256,256,256), mem_limit_gb=4):
     volume_dtype = volume.dtype if dtype is None else dtype
 
     root, z0 = write_level0_array(dst_file, volume.shape, volume_dtype, chunks, shards)
     write_batches(z0, volume, mem_limit_gb, dtype=volume_dtype)
 
-    # Clear some memory
-    del z0, volume
+    finish_zarr(root, dst_file, multiscale, voxel_size)
 
-    finish_zarr(root, dst_file, multiscale, scale)
-
-def finish_zarr(root, dst_file, multiscale, scale):
+def finish_zarr(root, dst_file, multiscale, voxel_size):
     if multiscale:
-        add_multiscales(dst_file, scale=scale)
+        add_multiscales(dst_file, scale=voxel_size)
     else:
-        write_multiscale_metadata(root, num_levels=1, scale=scale, name=Path(dst_file).stem)
+        write_multiscale_metadata(root, [voxel_size], name=Path(dst_file).stem)
 
 def items_per_batch(item_nbytes, mem_limit_gb):
     return max(1, int(mem_limit_gb * 1024**3) // max(int(item_nbytes), 1))
@@ -212,114 +258,62 @@ def write_batches(dst_vol, volume, mem_limit_gb, dtype=None):
         block = np.ascontiguousarray(volume[start:end])
         dst_vol[start:end] = block if dtype is None else block.astype(dtype, copy=False)
 
-def add_multiscales(src_file, scale=0.5):
+def add_multiscales(src_file, scale=(1.0, 1.0, 1.0), translation=(0.0, 0.0, 0.0)):
 
-    if not (0 < scale < 1):
-        raise ValueError(f"scale must be between 0 and 1 (exclusive), got {scale}")
-
-    # Load root node
     root = zarr.open(src_file, mode='r+')
 
-    axes = default_axes(root['0'].ndim)
-    extra_dims = len(axes) - 3
-    volume_shape = root['0'].shape
-    spatial_shape = np.array(volume_shape[-3:])
-    spatial_chunk = np.array(root['0'].chunks[-3:])
-    chunk_shape = root['0'].chunks
-    shard_shape = root['0'].shards
+    z0 = root['0']
+    spatial_chunks = z0.chunks[-3:]
+    spatial_shards = z0.shards[-3:] if z0.shards else None
 
-    # Number of downscale steps until the final size fits inside a chunk.
-    num_steps = max(0, int(np.floor(np.log((spatial_shape / spatial_chunk).max()) / np.log(1 / scale))))
+    # Number of downscale steps until the final size fits inside a chunk
+    num_steps = max(0, int(np.floor(np.log2((np.array(z0.shape[-3:]) / spatial_chunks).max()))))
 
-    # Create multiscale volume
     for i in range(num_steps):
-
-        z0 = root[str(i)]
-
-        z1_spatial_shape = tuple(int(x * scale) for x in z0.shape[-3:])
-        z1_shape = tuple(z0.shape[:extra_dims]) + z1_spatial_shape
-        z1 = root.create_array(name=str(i+1),
-                               shape=z1_shape,
-                               chunks=chunk_shape,
-                               shards=shard_shape,
-                               dtype=z0.dtype,
-                               dimension_names=axes,
-                               overwrite=True)
-        downsample_volume(z0, z1, scale=scale, block_size=shard_shape[-3], order=0)
+        src = root[str(i)]
+        dst_shape = src.shape[:-3] + tuple(s // 2 for s in src.shape[-3:])
+        dst = _create_array(root, str(i + 1), dst_shape, src.dtype, spatial_chunks, spatial_shards)
+        downsample_volume(src, dst, block_size=(spatial_shards or spatial_chunks)[0])
 
     write_multiscale_metadata(
-        root, num_levels=num_steps + 1, scale=scale, name=Path(src_file).stem)
+        root, [np.multiply(scale, 2 ** i) for i in range(num_steps + 1)], [translation] * (num_steps + 1), name=Path(src_file).stem)
 
-    # Clear some memory
-    del root
-
-def write_multiscale_metadata(root, num_levels, scale=0.5, name=None):
+def write_multiscale_metadata(root, scales, translations=None, *, name):
     axes = default_axes(root['0'].ndim)
     extra_dims = len(axes) - 3
+    translations = np.zeros_like(scales, dtype=float) if translations is None else translations
 
     multiscale = {
-        # Datasets are ordered finest to coarsest, as the standard requires
         'axes': [{'name': axis, 'type': _AXIS_TYPES.get(axis, 'space')} for axis in axes],
         'datasets': [
             {
                 'path': str(i),
                 'coordinateTransformations': [
                     # Leading channel/time axes are never downsampled
-                    {'type': 'scale', 'scale': [1.0] * extra_dims + [(1 / scale) ** i] * 3}
+                    {'type': 'scale', 'scale': [1.0] * extra_dims + [float(s) for s in scale]},
+                    {'type': 'translation', 'translation': [0.0] * extra_dims + [float(t) for t in translation]},
                 ],
             }
-            for i in range(num_levels)
+            for i, (scale, translation) in enumerate(zip(scales, translations))
         ],
+        'name': str(name),
     }
-
-    if name is not None:
-        multiscale['name'] = str(name)
 
     root.attrs['ome'] = {
         'version': '0.5',
         'multiscales': [multiscale],
     }
 
-def downsample_volume(src_vol, dst_vol, scale=0.5, block_size=512, order=0):
-    src_shape = np.array(src_vol.shape[-3:]).astype(int)
+def downsample_volume(src_vol, dst_vol, block_size=512):
+    """Halves each spatial axis by keeping every second voxel, one block at a time."""
     leading = (slice(None),) * (src_vol.ndim - 3)
+    shape = dst_vol.shape[-3:]
+    step = max(1, block_size // 2)
 
-    for i in range(0, src_shape[0], block_size):
-
-        i0, i1 = i, min(i + block_size, src_shape[0])
-        t_i0, t_i1 = int(i0 * scale), int(i1 * scale)
-        if t_i1 == t_i0:
-            continue
-
-        for j in range(0, src_shape[1], block_size):
-
-            j0, j1 = j, min(j + block_size, src_shape[1])
-            t_j0, t_j1 = int(j0 * scale), int(j1 * scale)
-            if t_j1 == t_j0:
-                continue
-
-            for k in range(0, src_shape[2], block_size):
-
-                k0, k1 = k, min(k + block_size, src_shape[2])
-                t_k0, t_k1 = int(k0 * scale), int(k1 * scale)
-                if t_k1 == t_k0:
-                    continue
-
-                # 1.0 for any leading (channel/time) axes -- never downsampled.
-                block_scale = (1.0,) * len(leading) + (
-                    (t_i1 - t_i0) / (i1 - i0),
-                    (t_j1 - t_j0) / (j1 - j0),
-                    (t_k1 - t_k0) / (k1 - k0),
-                )
-                block = src_vol[leading + (slice(i0, i1), slice(j0, j1), slice(k0, k1))]
-
-                # scipy's zoom has no float16 kernel
-                if block.dtype == np.float16:
-                    resized = zoom(block.astype(np.float32), block_scale, order=order).astype(np.float16)
-                else:
-                    resized = zoom(block, block_scale, order=order)
-
-                dst_vol[leading + (slice(t_i0, t_i1), slice(t_j0, t_j1), slice(t_k0, t_k1))] = resized
+    for index in np.ndindex(*(math.ceil(n / step) for n in shape)):
+        dst = tuple(slice(i * step, min((i + 1) * step, n)) for i, n in zip(index, shape))
+        src = tuple(slice(2 * s.start, 2 * s.stop, 2) for s in dst)
+        dst_vol[leading + dst] = src_vol[leading + src]
 
 
 def convert_tiff_file(
@@ -327,7 +321,7 @@ def convert_tiff_file(
         dst_file,
         input_axes=None,
         multiscale=True,
-        scale=0.5,
+        voxel_size=(1.0, 1.0, 1.0),
         chunks=(64,64,64),
         shards=(256,256,256),
         mem_limit_gb=4
@@ -342,24 +336,17 @@ def convert_tiff_file(
         volume = tiff.imread(src_file)
 
     if volume.ndim < 3:
-        raise ValueError(f"'{src_file}' is {volume.ndim}D; use convert_tiff_stack() for 2D slices")
+        raise ValueError(f"'{src_file}' is {volume.ndim}D. Use convert_tiff_stack() for 2D slices")
 
     volume = volume.transpose(transpose_order(input_axes, volume.ndim, src_file))
-
-    root, z0 = write_level0_array(dst_file, volume.shape, volume.dtype, chunks, shards)
-    write_batches(z0, volume, mem_limit_gb)
-
-    # Clear some memory
-    del z0, volume
-
-    finish_zarr(root, dst_file, multiscale, scale)
+    write_zarr(volume, dst_file, multiscale=multiscale, voxel_size=voxel_size, chunks=chunks, shards=shards, mem_limit_gb=mem_limit_gb)
 
 def convert_tiff_stack(
         src_folder,
         dst_file,
         input_axes=None,
         multiscale=True,
-        scale=0.5,
+        voxel_size=(1.0, 1.0, 1.0),
         chunks=(64,64,64),
         shards=(256,256,256),
         mem_limit_gb=4
@@ -382,30 +369,20 @@ def convert_tiff_stack(
     order = transpose_order(input_axes, len(input_shape), src_folder)
     volume_shape = tuple(input_shape[i] for i in order)
 
-    # Where the stacking dimension ends up once reordered
     stack_dim = order.index(0)
 
-    # Largest number of files that fit in memory at once
     files_per_write = items_per_batch(first_file.nbytes, mem_limit_gb)
-    volume_dtype = first_file.dtype
 
-    # Clear some memory
-    del first_file
-
-    # Copy original resolution to first level of the multiscale volume
-    root, z0 = write_level0_array(dst_file, volume_shape, volume_dtype, chunks, shards)
+    root, z0 = write_level0_array(dst_file, volume_shape, first_file.dtype, chunks, shards)
 
     for start in range(0, input_shape[0], files_per_write):
         end = min(start + files_per_write, input_shape[0])
         block = np.stack([tiff.imread(f) for f in tiff_files[start:end]], axis=0)
         z0[(slice(None),) * stack_dim + (slice(start, end),)] = block.transpose(order)
 
-    # Clear some memory
-    del z0
+    finish_zarr(root, dst_file, multiscale, voxel_size)
 
-    finish_zarr(root, dst_file, multiscale, scale)
-
-def write_tiff_stack(volume, dst_folder, mem_limit_gb=4):
+def write_tiff_stack(volume, dst_folder, mem_limit_gb=1):
 
     if not 3 <= volume.ndim <= 4:
         raise ValueError(f"Expected a 3D or 4D volume, got {volume.ndim}D")
@@ -419,14 +396,20 @@ def write_tiff_stack(volume, dst_folder, mem_limit_gb=4):
     slice_nbytes = int(np.prod(volume.shape[-2:])) * (volume.shape[0] if volume.ndim == 4 else 1) * volume.dtype.itemsize
     slices_per_read = items_per_batch(slice_nbytes, mem_limit_gb)
 
+    chunks = getattr(volume, 'chunks', None)
+    if chunks is not None:
+        slices_per_read = max(1, min(slices_per_read, chunks[-3]))
+
     for start in range(0, num_slices, slices_per_read):
         end = min(start + slices_per_read, num_slices)
 
         block = volume[(slice(None),) * (volume.ndim - 3) + (slice(start, end),)]
 
-        # Move the channel dimension last, leaving (z, y, x, c)
         if volume.ndim == 4:
             block = np.moveaxis(block, 0, -1)
 
         for i, image in enumerate(block, start=start):
-            tiff.imwrite(dst_folder / f'{i:0{digits}d}.tif', np.ascontiguousarray(image))
+            tiff.imwrite(
+                dst_folder / f'{i:0{digits}d}.tif', np.ascontiguousarray(image),
+                photometric='minisblack', planarconfig='contig'
+            )

@@ -55,6 +55,16 @@ convert_tiff_stack('slices/', 'out.zarr', input_axes='CYX')      # each slice is
 
 For a stack, the files are stacked along whichever axis they do not use themselves, so a folder of `CYX` slices becomes a `(c, z, y, x)` volume.
 
+## Voxel size
+
+The voxel size and position of every level are read from the OME-Zarr metadata. Volumes with non-cubic voxels, or pyramids that downsample some axes less than others (for example not along `z`), are therefore shown undistorted, and training and prediction see the same proportions.
+
+The helpers write cubic voxels unless told otherwise. Pass `voxel_size` in `z, y, x` order, in any unit:
+
+```python
+convert_tiff_stack('slices/', 'out.zarr', voxel_size=(50, 12, 12))  # 12 nm pixels, 50 nm sections
+```
+
 ## Exporting back to tiff
 
 `write_tiff_stack` is the inverse of `convert_tiff_stack`, and is what the **Also export
@@ -74,7 +84,7 @@ array.
 
 ## Memory
 
-Both tiff converters read in batches that stay under `mem_limit_gb` (4 GB by default), so volumes much larger than RAM can be converted. `write_tiff_stack` batches its reads the same way. `convert_tiff_file` additionally attempts to memory-maps the source when the tiff is uncompressed, rather than reading it in full:
+Both tiff converters read in batches that stay under `mem_limit_gb` (4 GB by default), so volumes much larger than RAM can be converted. `write_tiff_stack` batches its reads the same way, with a 1 GB default. `convert_tiff_file` additionally memory-maps the source when the tiff is uncompressed, rather than reading it in full:
 
 ```python
 convert_tiff_stack('path/to/tiff_stack/', 'path/to/output.zarr', mem_limit_gb=16)

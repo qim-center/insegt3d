@@ -1,64 +1,50 @@
-import hashlib
 import base64
-import shutil
+import math
+import asyncio
 import threading
 import cv2
 import numpy as np
-from urllib.parse import urlparse
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from functools import wraps
+from datetime import timedelta
 
-from nicegui import ui as nicegui_ui
+from nicegui import run, ui as nicegui_ui
 
-from insegt3d.app.scheduler import JobSpec
 from insegt3d.ml import predict2d as predict
-
-def _is_http_url(s: str) -> bool:
-    p = urlparse(s.strip())
-    return p.scheme in ("http", "https")
-
-def _url_id(url: str, length: int = 10) -> str:
-    """Short, filesystem-safe stable id for a URL."""
-    digest = hashlib.sha256(url.encode("utf-8")).digest()
-    token = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
-    return token[:length]
-
-# Keyed by the toggle widget's value (see ui.py's `toggle_annotation_mode`).
-_ANNOTATION_MODES = {0: 'draw', 1: 'save', 2: 'flood', 3: 'mask_fill'}
-_ANNOTATION_TOGGLE_VALUES = {mode: value for value, mode in _ANNOTATION_MODES.items()}
-
-def _mask_folder_name(zarr_ref) -> str:
-    """
-    Local: use folder name as-is.
-    Remote: <last_path_component>__<short_hash> (unique per URL).
-    """
-    s = str(zarr_ref).strip().rstrip("/")
-    if _is_http_url(s):
-        last = urlparse(s).path.rstrip("/").split("/")[-1] or "remote"
-        return f"{last}__{_url_id(s)}"
-    return Path(s).name
+from insegt3d.volume.io import resolve_zarr_inputs, volume_folder_name
+from insegt3d.volume.camera import AXIS_VIEWS
 
 def _prediction_label_path(project_path, zarr_ref) -> Path:
-    """
-    Path to the argmax label pyramid ml.predict2d.predict_volume writes for
-    a volume, mirroring predict_all_volumes' `predictions/<zarr_file.name>`
-    layout.
-    """
-    zarr_name = Path(str(zarr_ref).rstrip("/")).name
-    return Path(project_path) / 'predictions' / zarr_name / 'labels'
+    """Argmax label pyramid that ml.predict2d.predict_volume writes for a volume."""
+    return Path(project_path) / 'predictions' / volume_folder_name(zarr_ref) / 'labels'
+
+def level_label(level, factors):
+    if np.all(factors == factors[0]):
+        return f'Level {level} - ' + ('full resolution' if factors[0] == 1 else f'1/{factors[0]:g} resolution')
+    return f'Level {level} - ' + ', '.join(f'{axis} 1/{factor:g}' for axis, factor in zip('zyx', factors))
+
+def on_view(method):
+    """Runs the method on the event loop thread, and only while a browser view is open."""
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        def call():
+            if self.ui is not None:
+                method(self, *args, **kwargs)
+        self.scheduler.call_soon(call)
+    return wrapper
 
 class CallbackManager:
 
     def __init__(self, state, services, renderer, scheduler):
         self.ui = None
-        
         self.client = None
+        self.trainer = None
+
         self.state = state
         self.services = services
         self.renderer = renderer
         self.scheduler = scheduler
 
-        # State references
         self.nav = self.state.nav
         self.ui_state = self.state.ui
         self.data = self.state.data
@@ -66,49 +52,76 @@ class CallbackManager:
         self.camera = self.state.camera
         self.train = self.state.train
 
-        # Service references
         self.slicer = self.services.slicer
-        self.tracker = self.services.tracker
+        self.history = self.services.history
 
-        # Intensity histogram, computed once per loaded scan
         self._histogram_counts = None
         self._histogram_range = None
+        self._plane_idx = None
 
-        self._predict_exec = ThreadPoolExecutor(max_workers=1)
+        self._open_lock = asyncio.Lock()
         self._predict_cancel_event = threading.Event()
-        self.scheduler.register_sync(
-            "predict_volumes",
-            fn=self._run_predict_volumes,
-            spec=JobSpec(
-                mode="drop",
-                executor=self._predict_exec,
-                sequential_executor=False,
-            ),
-        )
+
+        self.scheduler.register_async("sync_navigator", self._sync_navigator, max_hz=15)
+
+    @on_view
+    def notify(self, message, type='warning'):
+        with self.client:
+            nicegui_ui.notify(message, type=type)
+
+    async def _sync_navigator(self):
+        if self.ui is not None:
+            self.ui.navigator.sync()
 
     def _request_slice_update(self):
         self.scheduler.request("nav_hires")
-        if "sync_navigator" in self.scheduler.jobs:
-            self.scheduler.request("sync_navigator")
+        self.scheduler.request("sync_navigator")
 
-    def _open_active_volume(self, update_histogram=True):
-        """
-        Points the slicer and navigator at data.active_zarr, along with its
-        mask folder and any prediction labels already written for it.
-        """
-        mask_path = Path(self.data.project_path) / 'masks' / _mask_folder_name(self.data.active_zarr)
-        label_path = _prediction_label_path(self.data.project_path, self.data.active_zarr)
+    async def _open_active_volume(self, update_histogram=True):
+        zarr_ref = self.data.active_zarr
 
-        self.slicer.initialize(
-            self.data.active_zarr, mask_path, self.camera,
-            center_camera=True, prediction_path=label_path,
-        )
-        self.ui.navigator.initialize(self.slicer.shapes[0], self.scheduler)
+        async with self._open_lock:
+            await run.io_bound(
+                self.slicer.initialize, zarr_ref, Path(self.data.project_path) / 'masks' / volume_folder_name(zarr_ref), self.camera,
+                center_camera=True, prediction_path=_prediction_label_path(self.data.project_path, zarr_ref),
+            )
+            self.history.clear()
 
-        if update_histogram:
-            self._update_histogram()
+            if update_histogram:
+                await self._update_histogram()
 
+        self.refresh_view()
+
+    def refresh_view(self):
+        if self.ui is None or self.slicer.images is None:
+            return
+
+        self.ui.navigator.initialize(self.slicer.world_shape)
+        self._refresh_intensity_range()
         self._refresh_prediction_overlay_availability()
+        self._refresh_level_options()
+        self.update_properties()
+        self._plane_idx = None
+        self.ui.label_plane.text = 'Annotated slices'
+
+    def _refresh_level_options(self):
+        num_levels = len(self.slicer.images) if self.slicer.images is not None else 0
+
+        if not self.train.model_locked and num_levels:
+            self.train.level = min(self.train.level, num_levels - 1)
+        self.ui.select_level.set_options(self.level_options(), value=self.train.level)
+
+        self.train.level_available = self.train.level < num_levels
+        self.ui.button_predict.set_enabled(self.train.level_available)
+        self.ui.label_live_train_status.text = '' if self.train.level_available else (
+            f'Training and prediction disabled: this volume has no level {self.train.level}.')
+
+    def level_options(self):
+        options = {}
+        if self.slicer.images is not None:
+            options = {level: level_label(level, factors) for level, factors in enumerate(self.slicer.voxel_sizes / self.slicer.voxel_sizes[0])}
+        options.setdefault(self.train.level, f'Level {self.train.level}')
+        return options
 
     def on_viewport_resize(self, e):
         d = e.args['detail']
@@ -116,7 +129,7 @@ class CallbackManager:
         self.ui_state.viewport_shape = (h, w)
         self.nav.slice_shape = self._clamp_slice_shape(h, w)
 
-        self.ui.slider_brush_size.props(f'max={self.ui_state.max_brush_size()}')
+        self.ui.slider_brush_size.props['max'] = self.ui_state.max_brush_size()
         self.set_brush_size()
 
         if self.slicer.zarr_path is not None:
@@ -126,106 +139,78 @@ class CallbackManager:
         max_pixels = self.nav.max_slice_megapixels * 1e6
         num_pixels = h * w
 
-        if num_pixels <= max_pixels or num_pixels <= 0:
+        if num_pixels <= max_pixels:
             return (h, w)
 
         scale = (max_pixels / num_pixels) ** 0.5
         return (max(1, round(h * scale)), max(1, round(w * scale)))
 
-    def _fail_zarr_load(self, message):
-        self.ui.select_scan.options = {}
-        self.ui.select_scan.update()
-        nicegui_ui.notify(message, type='warning')
-
-    def load_zarr_files(self):
-        input_path = (self.ui.input_path.value or "").strip()
-
-        if not input_path:
-            self._fail_zarr_load('Enter a path or URL to load.')
+    async def load_zarr_files(self):
+        try:
+            zarr_files = await run.io_bound(resolve_zarr_inputs, self.data.input_path)
+        except (FileNotFoundError, ValueError) as e:
+            nicegui_ui.notify(str(e), type='warning')
             return
 
-        if "," in input_path:
-            # Multiple comma separated remote urls
-            parts = [p.strip() for p in input_path.split(",") if p.strip()]
-            if parts and all(_is_http_url(p) for p in parts):
-                self.data.zarr_files = parts
-            else:
-                self._fail_zarr_load('All comma-separated paths must be http(s) URLs.')
-                return
-        elif _is_http_url(input_path):
-            # Single remote URL
-            self.data.zarr_files = [input_path]
-        else:
-            # Single local zarr file or folder containing multiple zarr files
-            root = Path(input_path)
+        if zarr_files == self.data.zarr_files:
+            return
 
-            if root.suffix == ".zarr":
-                self.data.zarr_files = [root]
-
-            elif root.exists() and root.is_dir():
-                self.data.zarr_files = sorted(root.glob("*.zarr"))
-                if not self.data.zarr_files:
-                    self._fail_zarr_load(f"No .zarr files found in '{input_path}'.")
-                    return
-            else:
-                self._fail_zarr_load(f"Path not found: '{input_path}'.")
-                return
-
+        self.data.zarr_files = zarr_files
         self.data.zarr_idx = 0
 
-        self._open_active_volume()
+        # set_options only fires select_scan if the selection changes, so call it directly otherwise
+        selection_changed = self.ui.select_scan.value != 0
+        self.ui.select_scan.set_options(self.scan_options(), value=0)
 
-        # Update UI select with zarr names
-        # Local: ".../something.zarr" -> "something"
-        # Remote: ".../xray" -> "xray"
-        names = [Path(str(f).rstrip("/")).stem for f in self.data.zarr_files]
-        self.ui.select_scan.options = dict(enumerate(names))
-        self.ui.select_scan.update()
+        if not selection_changed:
+            await self.select_scan()
 
-        # Request slice update
+    def scan_options(self):
+        return {i: Path(str(f).rstrip("/")).stem for i, f in enumerate(self.data.zarr_files)} or {0: 'None'}
+
+    async def select_scan(self):
+
+        self.data.zarr_idx = int(self.ui.select_scan.value or 0)
+        if self.data.active_zarr is None:
+            return
+
+        try:
+            await self._open_active_volume()
+        except Exception:
+            nicegui_ui.notify(f'Could not open {self.data.active_zarr}.', type='negative')
+            self.data.zarr_files = []
+            self.ui.select_scan.set_options(self.scan_options(), value=0)
+            raise
+
         self._request_slice_update()
 
-    def select_scan(self):
-
-        self.data.zarr_idx = int(self.ui.select_scan.value)
-
-        self._open_active_volume()
-        self._request_slice_update()
-
+    @on_view
     def _refresh_prediction_overlay_availability(self):
         available = self.slicer.has_prediction
         self.ui.checkbox_saved_prediction_overlay.set_enabled(available)
         self.ui.slider_saved_prediction_opacity.set_enabled(available)
-        if not available and self.ui.checkbox_saved_prediction_overlay.value:
+        if not available:
             self.ui.checkbox_saved_prediction_overlay.value = False
-            self.ui_state.saved_prediction.visible = False
 
-    def _update_histogram(self):
-        counts, value_range = self.slicer.compute_histogram()
+    async def _update_histogram(self):
+        counts, value_range, (low, high) = await run.io_bound(self.slicer.intensity_stats)
         self._histogram_counts = counts
         self._histogram_range = value_range
 
-        if value_range is not None:
-            v_min, v_max = value_range
+        v_min, v_max = value_range
 
-            robust_range = self.slicer.get_robust_intensity_range()
-            if robust_range is not None:
-                low, high = robust_range
-                low = float(np.clip(low, v_min, v_max))
-                high = float(np.clip(high, v_min, v_max))
-            else:
-                low, high = v_min, v_max
+        self.ui_state.intensity_low = float(np.clip(low, v_min, v_max))
+        self.ui_state.intensity_high = float(np.clip(high, v_min, v_max))
 
-            self.ui_state.intensity_low = low
-            self.ui_state.intensity_high = high
+    def _refresh_intensity_range(self):
+        v_min, v_max = self._histogram_range
+        step = max((v_max - v_min) / 500.0, 1e-6)
 
-            step = max((v_max - v_min) / 500.0, 1e-6)
-
-            self.ui.range_intensity.min = v_min
-            self.ui.range_intensity.max = v_max
-            self.ui.range_intensity.step = step
-            self.ui.range_intensity.value = {'min': low, 'max': high}
-            self.ui.range_intensity.update()
+        self.ui.range_intensity.min = v_min
+        self.ui.range_intensity.max = v_max
+        self.ui.range_intensity.step = step
+        self.ui.range_intensity.value = {'min': self.ui_state.intensity_low, 'max': self.ui_state.intensity_high}
+        self.ui.range_intensity.update()
 
         self._refresh_histogram_image()
         self._refresh_intensity_label()
@@ -277,9 +262,9 @@ class CallbackManager:
     @staticmethod
     def _render_histogram_image(counts, value_range, low, high, width=440, height=64):
         background = (245, 245, 245)
-        bar_color = (165, 176, 191)      # slate-300ish: bins inside the selected window
-        dim_color = (223, 226, 231)      # gray-200ish: bins outside the selected window
-        marker_color = (220, 38, 38)     # red-600: window boundaries
+        bar_color = (165, 176, 191)
+        dim_color = (223, 226, 231)
+        marker_color = (220, 38, 38)
 
         canvas = np.full((height, width, 3), background, dtype=np.uint8)
 
@@ -293,7 +278,7 @@ class CallbackManager:
         bin_edges = v_min + (np.arange(n_bins + 1) / n_bins) * span
         bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
 
-        # Log scale so a single dominant bin (e.g. background) doesn't flatten the rest.
+        # Log scale so a single dominant bin (e.g. background) doesn't flatten the rest
         heights = np.log1p(counts.astype(np.float32))
         max_height = heights.max()
         if max_height > 0:
@@ -319,50 +304,37 @@ class CallbackManager:
         self.annot.color_idx = int(i)
         self.refresh_button_palette()
 
+    @on_view
     def refresh_button_palette(self):
-        """
-        Enables one palette button per class and outlines the active one.
-        """
-        num_classes = int(self.train.num_classes)
-
-        if num_classes > 0:
-            self.annot.color_idx = max(0, min(int(self.annot.color_idx), num_classes - 1))
-        else:
-            self.annot.color_idx = 0
+        self.annot.color_idx = min(self.annot.color_idx, self.train.num_classes - 1)
 
         for i, button in enumerate(self.ui.button_palette):
-            enabled = i < num_classes
-            button.set_enabled(enabled)
+            border = 'black' if i == self.annot.color_idx else 'transparent'
+            button.set_visibility(i < self.train.num_classes)
+            button.style(f'background:{self.annot.colors[i]} !important; border:2px solid {border};')
 
-            if enabled:
-                border = 'black' if i == self.annot.color_idx else 'transparent'
-                button.style(f'opacity:1.0; filter:none; border:2px solid {border};')
-            else:
-                button.style('opacity:0.25; filter:grayscale(100%); border:2px solid transparent;')
+        self.ui.button_add_class.set_visibility(self.train.num_classes < len(self.annot.colors))
+        self.ui.button_remove_class.set_visibility(self.train.num_classes > 2)
 
-    def undo(self):
-        self.slicer.undo()
-        self.tracker.undo()
-        self._request_slice_update()
+    def add_class(self):
+        if not self.train.changing_classes:
+            self.train.changing_classes = True
+            self.scheduler.request("change_classes")
 
-    def redo(self):
-        self.slicer.redo()
-        self.tracker.redo()
-        self._request_slice_update()
+    async def remove_class(self):
+        if self.train.changing_classes:
+            return
 
-    def toggle_annotation_mode(self):
-        self.annot.annotating = False
-        
-        mode = _ANNOTATION_MODES.get(self.ui.toggle_annotation_mode.value)
-        if mode is not None:
-            self.annot.mode = mode
-
-    def set_annotation_mode(self):
-        self.annot.annotating = False
-        
-        toggle_value = _ANNOTATION_TOGGLE_VALUES.get(self.annot.mode)
-        if toggle_value is not None:
-            self.ui.toggle_annotation_mode.value = toggle_value
+        i = self.annot.color_idx
+        annotations = [a for a in self.services.tracker.annotations() if a.class_idx == i + 1]
+        volumes = len({a.volume_path for a in annotations})
+        self.ui.label_remove_class.text = (
+            f'Remove class {i + 1}? Its {len(annotations)} annotation(s) in {volumes} volume(s) will be erased and later '
+            f'classes renumbered, keeping their colours. Existing predictions keep the old classes. This cannot be undone.'
+        )
+        if await self.ui.dialog_remove_class:
+            self.train.changing_classes = True
+            self.scheduler.request("change_classes", i)
 
     def _clamp_brush_size(self, size):
         return max(1, min(size, self.ui_state.max_brush_size()))
@@ -374,36 +346,72 @@ class CallbackManager:
         self.annot.brush_size = self._clamp_brush_size(self.annot.brush_size)
         self.ui.slider_brush_size.value = self.annot.brush_size
 
-    def toggle_prediction_overlay(self):
-        self.ui_state.prediction.visible = self.ui.checkbox_prediction_overlay.value
-        self.renderer.update()
+    def toggle_live_prediction(self):
+        checkbox = self.ui.checkbox_prediction_overlay
+        checkbox.value = not checkbox.value
 
-    def set_prediction_overlay(self):
-        self.ui.checkbox_prediction_overlay.value = self.ui_state.prediction.visible
-        self.renderer.update()
+    def align_view(self, axis):
+        self.camera.set_view(self.camera.origin, self.camera.zoom, AXIS_VIEWS[axis])
+        self._request_slice_update()
 
-    def update_prediction_opacity(self):
-        self.ui_state.prediction.alpha = self.ui.slider_prediction_opacity.value
-        self.renderer.update()
+    def center_view(self):
+        if self.slicer.images is not None:
+            self.camera.reset(self.slicer.world_shape)
+            self._request_slice_update()
 
-    def toggle_mask_overlay(self):
-        self.ui_state.mask.visible = self.ui.checkbox_mask_overlay.value
-        self.renderer.update()
+    async def go_to(self):
+        if self.slicer.images is None:
+            return
 
-    def update_mask_opacity(self):
-        self.ui_state.mask.alpha = self.ui.slider_mask_opacity.value
-        self.renderer.update()
+        fields = self.ui.numbers_go_to
+        for field, value in zip(fields, (*self.camera.origin / self.slicer.voxel_sizes[0], *self.camera.u)):
+            field.value = round(float(value), 3)
+        if not await self.ui.dialog_go_to:
+            return
 
-    def toggle_saved_prediction_overlay(self):
-        self.ui_state.saved_prediction.visible = self.ui.checkbox_saved_prediction_overlay.value
-        self.renderer.update()
+        location, normal = np.split(np.array([field.value or 0 for field in fields], dtype=np.float64), 2)
+        self.camera.set_view(location * self.slicer.voxel_sizes[0], self.camera.zoom, self.camera.uvw)
+        if normal.any():
+            self.camera.look_along(normal)
+        self._request_slice_update()
 
-    def update_saved_prediction_opacity(self):
-        self.ui_state.saved_prediction.alpha = self.ui.slider_saved_prediction_opacity.value
-        self.renderer.update()
+    def _annotated_planes(self):
+        planes = {}
+        for a in self.services.tracker.annotations():
+            if a.volume_path == str(self.slicer.zarr_path):
+                # Strokes with the same normal (up to sign) and offset along it lie on the same plane
+                u = a.camera.u * np.sign(a.camera.u[np.argmax(np.abs(a.camera.u))])
+                planes.setdefault((*np.round(u, 3), round(float(u @ a.camera.origin))), []).append(a)
+        return list(planes.values())
 
+    def step_plane(self, step):
+        planes = self._annotated_planes()
+        if not planes:
+            return
+
+        start = len(planes) if self._plane_idx is None else self._plane_idx
+        self._plane_idx = (start + step) % len(planes)
+        annotations = planes[self._plane_idx]
+
+        # Frame every stroke on the plane, but never zoom in past full resolution
+        ref = annotations[-1].camera
+        axes = np.stack([ref.v, ref.w])
+        corners = np.array([
+            a.camera.origin + sv * a.extent[3] * a.camera.v + sw * a.extent[5] * a.camera.w
+            for a in annotations for sv in (-1, 1) for sw in (-1, 1)
+        ])
+        rel = (corners - ref.origin) @ axes.T
+        lo, hi = rel.min(axis=0), rel.max(axis=0)
+        zoom = max(1.0, 1.2 * float(np.max((hi - lo) / self.nav.slice_shape)))
+
+        self.camera.set_view(ref.origin + ((lo + hi) / 2) @ axes, zoom, ref.uvw)
+        self.ui_state.mask.visible = True
+        self.ui.label_plane.text = f'Annotated slice {self._plane_idx + 1} / {len(planes)}'
+        self._request_slice_update()
+
+    @on_view
     def update_properties(self):
-        origin = self.camera.origin
+        origin = self.camera.origin / self.slicer.voxel_sizes[0]
         u, v, w = self.camera.uvw
         zoom = 1 / self.camera.zoom
         volume_shape = self.slicer.shapes[0]
@@ -420,6 +428,10 @@ class CallbackManager:
 
     def predict_volumes(self):
         self._predict_cancel_event.clear()
+        self.train.predicting = True
+        self.ui.button_cancel_predict.set_enabled(True)
+        self.ui.button_cancel_predict.set_text('Cancel')
+        self._show_predict_status(f'Preparing {len(self.data.zarr_files)} volume(s)...')
         self.scheduler.request("predict_volumes")
 
     def cancel_predict_volumes(self):
@@ -427,108 +439,57 @@ class CallbackManager:
         self.ui.button_cancel_predict.set_enabled(False)
         self.ui.button_cancel_predict.set_text('Cancelling...')
 
-    @staticmethod
-    def _format_duration(seconds):
-        if seconds is None or seconds < 0:
-            return '--'
-
-        seconds = int(round(seconds))
-        minutes, seconds = divmod(seconds, 60)
-        hours, minutes = divmod(minutes, 60)
-
-        if hours:
-            return f'{hours}h {minutes:02d}m'
-        if minutes:
-            return f'{minutes}m {seconds:02d}s'
-        return f'{seconds}s'
+    @on_view
+    def _show_predict_status(self, status, progress=0.0, chunks=''):
+        self.ui.label_predict_status.text = status
+        self.ui.progress_predict.value = progress
+        self.ui.label_predict_chunks.text = chunks
 
     def _on_predict_progress(self, volume_name, vol_idx, num_volumes, block_idx, num_blocks, eta_seconds):
-        self.ui.label_predict_status.text = f'Predicting {volume_name}... - ({vol_idx + 1}/{num_volumes})'
-        self.ui.progress_predict.value = (block_idx / num_blocks) if num_blocks else 0.0
-        self.ui.label_predict_chunks.text = f'{block_idx}/{num_blocks} blocks · ETA {self._format_duration(eta_seconds)}'
+        self._show_predict_status(
+            f'Predicting {volume_name}... - ({vol_idx + 1}/{num_volumes})',
+            (block_idx / num_blocks) if num_blocks else 0.0,
+            f'{block_idx}/{num_blocks} blocks · ETA {timedelta(seconds=round(eta_seconds))}',
+        )
 
-    def _run_predict_volumes(self):
+    def run_predict_volumes(self):
         self.train.predicting = True
+        live_prediction_visible = self.ui_state.prediction.visible
+        self.ui_state.prediction.visible = False
 
         for job_name in ("live_train", "live_predict"):
-            if job_name in self.scheduler.jobs:
-                self.scheduler.jobs[job_name].cancel()
-
-        self.ui.button_predict.set_enabled(False)
-        self.ui.button_predict.set_text('Predicting...')
-        self.ui.button_load.set_enabled(False)
-        self.ui.button_reset_model.set_enabled(False)
-        self.ui.checkbox_export_tiff.set_enabled(False)
-        self.ui.checkbox_prediction_overlay.set_enabled(False)
-        self.ui.slider_prediction_opacity.set_enabled(False)
-        self.ui_state.prediction.visible = False
-        self.set_prediction_overlay()
-
-        self.ui.label_predict_status.text = f'Preparing {len(self.data.zarr_files)} volume(s)...'
-        self.ui.label_predict_status.set_visibility(True)
-        self.ui.progress_predict.value = 0.0
-        self.ui.progress_predict.set_visibility(True)
-        self.ui.label_predict_chunks.text = ''
-        self.ui.label_predict_chunks.set_visibility(True)
-        self.ui.button_cancel_predict.set_visibility(True)
+            self.scheduler.jobs[job_name].cancel()
 
         cancelled_volume = None
         try:
-            predict.predict_all_volumes(
+            self.trainer.predict_volumes(
                 self.data.zarr_files,
-                self.data.project_path,
-                num_classes=self.train.num_classes,
+                Path(self.data.project_path),
                 export_tiff=self.train.export_tiff,
                 progress_callback=self._on_predict_progress,
                 cancel_event=self._predict_cancel_event
             )
         except predict.PredictionCancelled as e:
             cancelled_volume = e.volume_name
+        except Exception as e:
+            self.notify(f'Prediction failed: {e}', type='negative')
+            raise
         finally:
             self.train.predicting = False
-
-            self.ui.label_predict_status.set_visibility(False)
-            self.ui.progress_predict.set_visibility(False)
-            self.ui.label_predict_chunks.set_visibility(False)
-            self.ui.button_cancel_predict.set_visibility(False)
-            self.ui.button_cancel_predict.set_enabled(True)
-            self.ui.button_cancel_predict.set_text('Cancel')
-
-            self.ui.button_predict.set_enabled(True)
-            self.ui.button_predict.set_text('Predict')
-            self.ui.button_load.set_enabled(True)
-            self.ui.button_reset_model.set_enabled(True)
-            self.ui.checkbox_export_tiff.set_enabled(True)
-            self.ui.checkbox_prediction_overlay.set_enabled(True)
-            self.ui.slider_prediction_opacity.set_enabled(True)
-            self.ui_state.prediction.visible = True
-            self.set_prediction_overlay()
+            self.ui_state.prediction.visible = live_prediction_visible
 
             if self.data.active_zarr is not None:
                 label_path = _prediction_label_path(self.data.project_path, self.data.active_zarr)
                 self.slicer.refresh_prediction(label_path)
                 self._refresh_prediction_overlay_availability()
 
-            if "live_predict" in self.scheduler.jobs:
-                self.scheduler.request("live_predict")
-
+            self.scheduler.request("live_predict")
             self._request_slice_update()
 
         if cancelled_volume is not None:
-            with self.client:
-                nicegui_ui.notify(f'Prediction cancelled — removed partial output for {cancelled_volume}.', type='warning')
+            self.notify(f'Prediction cancelled — removed partial output for {cancelled_volume}.')
         elif self._predict_cancel_event.is_set():
-            with self.client:
-                nicegui_ui.notify('Prediction cancelled.', type='warning')
-
-    def close(self):
-        self._predict_exec.shutdown(wait=False, cancel_futures=True)
-
-    def toggle_export_tiff(self):
-        self.train.export_tiff = self.ui.checkbox_export_tiff.value
-
-    def toggle_live_training(self):
-        self.train.live_training_enabled = self.ui.checkbox_live_training.value
+            self.notify('Prediction cancelled.')
 
     def select_architecture(self):
         self.train.architecture = self.ui.select_architecture.value
@@ -538,42 +499,53 @@ class CallbackManager:
         self.train.encoder_name = self.ui.select_encoder.value
         self._rebuild_model_if_unlocked()
 
+    def update_level(self):
+        self.train.level = int(self.ui.select_level.value)
+        self._refresh_level_options()
+        self._rebuild_model_if_unlocked()
+
+    def _round_up_odd(self, value, lo, hi):
+        value = min(max(math.ceil(value or lo), lo), hi)
+        return value if value % 2 else value + 1
+
+    def update_slab_size(self):
+        self.train.slab_size = self._round_up_odd(self.ui.number_slab_size.value, 1, 15)
+        self.ui.number_slab_size.value = self.train.slab_size
+        self._rebuild_model_if_unlocked()
+
+    def update_scnp_size(self):
+        self.train.scnp_size = self._round_up_odd(self.ui.number_scnp_size.value, 3, 15)
+        self.ui.number_scnp_size.value = self.train.scnp_size
+
     def _rebuild_model_if_unlocked(self):
-        if self.train.model_locked:
-            return
-        if "reset_model" in self.scheduler.jobs:
+        if not self.train.model_locked:
             self.scheduler.request("reset_model")
 
+    @on_view
     def set_model_lock(self):
         enabled = not self.train.model_locked
         self.ui.select_architecture.set_enabled(enabled)
         self.ui.select_encoder.set_enabled(enabled)
+        self.ui.number_slab_size.set_enabled(enabled)
+        self.ui.select_level.set_enabled(enabled)
 
+    @on_view
     def update_live_train_progress(self, step, total_steps, loss):
         self.ui.progress_live_train.value = (step / total_steps) if total_steps else 0.0
         self.ui.label_live_train_status.text = f'Step {step}/{total_steps} · loss {loss:.4f}'
 
-    def update_learning_rate(self):
-        self.train.lr = float(self.ui.number_learning_rate.value)
+    @on_view
+    def show_live_train_hint(self, text):
+        self.ui.progress_live_train.value = 0.0
+        self.ui.label_live_train_status.text = text
 
-    def update_batch_size(self):
-        self.train.batch_size = int(self.ui.number_batch_size.value)
+    async def reset_annotations(self):
+        if not await self.ui.dialog_reset_annotations:
+            return
 
-    def update_steps_per_epoch(self):
-        self.train.steps_per_epoch = int(self.ui.number_steps_per_epoch.value)
-
-    def reset_model(self):
-        if "reset_model" in self.scheduler.jobs:
-            self.scheduler.request("reset_model")
-
-    def reset_annotations(self):
-        self.tracker.reset()
-
-        masks_root = Path(self.data.project_path) / 'masks'
-        if masks_root.exists():
-            shutil.rmtree(masks_root)
+        await run.io_bound(self.history.reset, Path(self.data.project_path) / 'masks')
 
         if self.data.active_zarr is not None:
-            self._open_active_volume(update_histogram=False)
+            await self._open_active_volume(update_histogram=False)
 
         self._request_slice_update()

@@ -1,16 +1,14 @@
 import numpy as np
 from numba import njit, prange
 
-@njit(inline="always")
-def _clamp_int(value, low, high):
-    if value < low:
-        return low
-    if value > high:
-        return high
-    return value
+ERASE = 255
 
-@njit(parallel=True, fastmath=True)
+# Grid index (di, hi, wi) maps to voxel origin + d * normal_axis + y * a0 + x * a1,
+# with d = d0 + di * dd, y = y0 + hi * dy and x = x0 + wi * dx
+
+@njit(parallel=True, fastmath=True, cache=True)
 def write_nearest(volume, data, origin, normal_axis, a0, a1, d0, dd, y0, dy, x0, dx):
+    """Inverse of read_nearest: writes the nonzero values of data into the voxels the grid covers, with ERASE writing 0."""
 
     Z, Y, X = volume.shape
     D, H, W = data.shape
@@ -36,9 +34,8 @@ def write_nearest(volume, data, origin, normal_axis, a0, a1, d0, dd, y0, dy, x0,
                 yy = rz*a0[0]          + ry*a0[1]          + rx*a0[2]
                 xx = rz*a1[0]          + ry*a1[1]          + rx*a1[2]
 
-                # depth index
                 if D == 1:
-                    # Reject voxels far from the intended slice plane
+                    # Single slice: only voxels within half a voxel of the plane
                     if np.abs(d - d0) > d_halfwidth:
                         continue
                     di = 0
@@ -47,7 +44,6 @@ def write_nearest(volume, data, origin, normal_axis, a0, a1, d0, dd, y0, dy, x0,
                     if di < 0 or di >= D:
                         continue
 
-                # y/x indices
                 if H == 1:
                     hi = 0
                 else:
@@ -63,9 +59,9 @@ def write_nearest(volume, data, origin, normal_axis, a0, a1, d0, dd, y0, dy, x0,
 
                 val = data[di, hi, wi]
                 if val != 0:
-                    volume[z, y, x] = val
+                    volume[z, y, x] = 0 if val == ERASE else val
 
-@njit(parallel=True, fastmath=True)
+@njit(fastmath=True, nogil=True, cache=True)
 def read_nearest(volume, output, origin, normal_axis, a0, a1, d0, dd, y0, dy, x0, dx):
 
     Z, Y, X = volume.shape
@@ -74,7 +70,7 @@ def read_nearest(volume, output, origin, normal_axis, a0, a1, d0, dd, y0, dy, x0
     ymax = Y - 1
     xmax = X - 1
 
-    for di in prange(D):
+    for di in range(D):
         d = d0 + di * dd
         for hi in range(H):
             y = y0 + hi * dy
@@ -85,9 +81,9 @@ def read_nearest(volume, output, origin, normal_axis, a0, a1, d0, dd, y0, dy, x0
                 gy = origin[1] + d*normal_axis[1] + y*a0[1] + x*a1[1]
                 gx = origin[2] + d*normal_axis[2] + y*a0[2] + x*a1[2]
 
-                iz = _clamp_int(int(np.rint(gz)), 0, zmax)
-                iy = _clamp_int(int(np.rint(gy)), 0, ymax)
-                ix = _clamp_int(int(np.rint(gx)), 0, xmax)
+                iz = min(max(int(np.rint(gz)), 0), zmax)
+                iy = min(max(int(np.rint(gy)), 0), ymax)
+                ix = min(max(int(np.rint(gx)), 0), xmax)
 
                 output[di, hi, wi] = volume[iz, iy, ix]
 
@@ -95,7 +91,7 @@ def read_nearest(volume, output, origin, normal_axis, a0, a1, d0, dd, y0, dy, x0
 def _linear_interpolate(a, b, t):
     return a + t * (b - a)
 
-@njit(parallel=True, fastmath=True)
+@njit(fastmath=True, nogil=True, cache=True)
 def read_trilinear(volume, output, origin, normal_axis, a0, a1, d0, dd, y0, dy, x0, dx):
 
     Z, Y, X = volume.shape
@@ -104,7 +100,7 @@ def read_trilinear(volume, output, origin, normal_axis, a0, a1, d0, dd, y0, dy, 
     ymax = Y - 1
     xmax = X - 1
 
-    for di in prange(D):
+    for di in range(D):
         d = d0 + di * dd
         for hi in range(H):
             y = y0 + hi * dy
@@ -123,12 +119,12 @@ def read_trilinear(volume, output, origin, normal_axis, a0, a1, d0, dd, y0, dy, 
                 ty = gy - y0i
                 tx = gx - x0i
 
-                z0c = _clamp_int(z0i, 0, zmax)
-                y0c = _clamp_int(y0i, 0, ymax)
-                x0c = _clamp_int(x0i, 0, xmax)
-                z1c = _clamp_int(z0i + 1, 0, zmax)
-                y1c = _clamp_int(y0i + 1, 0, ymax)
-                x1c = _clamp_int(x0i + 1, 0, xmax)
+                z0c = min(max(z0i, 0), zmax)
+                y0c = min(max(y0i, 0), ymax)
+                x0c = min(max(x0i, 0), xmax)
+                z1c = min(max(z0i + 1, 0), zmax)
+                y1c = min(max(y0i + 1, 0), ymax)
+                x1c = min(max(x0i + 1, 0), xmax)
 
                 c000 = volume[z0c, y0c, x0c]
                 c001 = volume[z0c, y0c, x1c]

@@ -1,13 +1,12 @@
 import sys
+import ctypes
+import socket
 import argparse
-import numpy as np
 from nicegui import ui, app
-from insegt3d.app import InteractiveSegmentationApp
+from insegt3d.app.app import InteractiveSegmentationApp
 
 class StripRootPath:
-    """
-    ASGI middleware to strip the base path from incoming Nginx requests.
-    """
+    """ASGI middleware to strip the base path from requests forwarded by a reverse proxy such as Nginx."""
     def __init__(self, asgi_app, root_path: str):
         self.asgi_app = asgi_app
         self.root_path = root_path.rstrip("/")
@@ -15,24 +14,29 @@ class StripRootPath:
     async def __call__(self, scope, receive, send):
         if scope["type"] in ("http", "websocket"):
             path = scope.get("path", "")
-            if path.startswith(self.root_path):
+            if path == self.root_path or path.startswith(self.root_path + "/"):
                 scope["path"] = path[len(self.root_path):] or "/"
                 scope["root_path"] = self.root_path
         await self.asgi_app(scope, receive, send)
 
 def _normalize_base_path(base_path: str | None) -> str:
-    if not base_path:
-        return ''
-    normalized = base_path.strip()
-    if not normalized:
-        return ''
-    if not normalized.startswith('/'):
-        normalized = f'/{normalized}'
-    if len(normalized) > 1 and normalized.endswith('/'):
-        normalized = normalized.rstrip('/')
-    return normalized
+    base_path = (base_path or '').strip().strip('/')
+    return f'/{base_path}' if base_path else ''
+
+def _free_port() -> int:
+    with socket.socket() as s:
+        s.bind(('', 0))
+        return s.getsockname()[1]
+
+def _return_freed_memory_to_os():
+    # glibc otherwise keeps freed chunk buffers in per-thread pools, which can grow past the cache size
+    try:
+        ctypes.CDLL('libc.so.6').mallopt(-3, 256 * 1024)  # M_MMAP_THRESHOLD
+    except OSError:
+        pass
 
 def main():
+    _return_freed_memory_to_os()
     argv = sys.argv[1:]
 
     if argv and argv[0] == 'predict':
@@ -71,27 +75,34 @@ def main():
         )
     )
     parser.add_argument(
-        '--num_classes',
-        type=int,
-        default=2,
-        choices=range(2, 11),
-        help='Number of classes (must be between 2 and 10)'
+        '--cache_gb',
+        type=float,
+        default=16,
+        help='Memory for cached volume data, in GiB (default: 16)'
     )
     args = parser.parse_args()
 
-    # Fall back to a random high port when none is given
-    port = args.port if args.port else np.random.randint(20000, 40000)
+    port = args.port or _free_port()
     root_path = _normalize_base_path(args.server_base_path)
 
     if root_path:
         app.add_middleware(StripRootPath, root_path=root_path)
 
+    segmentation_app = None
+
+    def start():
+        nonlocal segmentation_app
+        segmentation_app = InteractiveSegmentationApp(args)
+
+    app.on_startup(start)
+    app.on_shutdown(lambda: segmentation_app.close())
+
     @ui.page('/')
     def index():
-        InteractiveSegmentationApp(args)
+        segmentation_app.open_view()
 
-    # Start the server
-    ui.run(host='0.0.0.0', port=port, show=False, reload=False, root_path=root_path)
+    # JPEG frames barely compress, and deflating them would block the event loop
+    ui.run(host=args.host, port=port, show=False, reload=False, root_path=root_path, ws_per_message_deflate=False)
 
 if __name__ in {"__main__", "__mp_main__"}:
     main()

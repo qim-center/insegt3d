@@ -1,45 +1,11 @@
 import argparse
 from pathlib import Path
 
+import torch
+
 from insegt3d.ml import predict2d
-from insegt3d.volume.io import is_multiscale_zarr
-
-
-def _is_http_url(path: str) -> bool:
-    return path.startswith('http://') or path.startswith('https://')
-
-
-def resolve_zarr_inputs(data_path: str) -> list:
-    """
-    Resolves --data into a list of zarr volume paths/URLs: a single zarr
-    store, every zarr subfolder of a containing directory, or a single
-    http(s) zarr URL.
-    """
-    data_path = str(data_path)
-
-    if _is_http_url(data_path):
-        return [data_path]
-
-    path = Path(data_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Data path not found: {data_path}")
-    if not path.is_dir():
-        raise ValueError(f"Data path must be a zarr directory, a folder of zarrs, or an http(s) URL: {data_path}")
-
-    # Is this directory itself a (multiscale) zarr store?
-    if is_multiscale_zarr(path):
-        return [str(path)]
-
-    # Otherwise, treat it as a folder containing multiple zarr volumes.
-    zarr_files = [
-        str(sub) for sub in sorted(path.iterdir())
-        if sub.is_dir() and is_multiscale_zarr(sub)
-    ]
-
-    if not zarr_files:
-        raise ValueError(f"No zarr volumes found under {data_path}")
-
-    return zarr_files
+from insegt3d.ml.unet2d import UNet2D, load_checkpoint
+from insegt3d.volume.io import resolve_zarr_inputs
 
 
 def build_predict_parser() -> argparse.ArgumentParser:
@@ -58,10 +24,6 @@ def build_predict_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--output', type=str, required=True,
         help='Output directory. Predictions are written to <output>/predictions/<volume_name>.'
-    )
-    parser.add_argument(
-        '--num-classes', type=int, default=None,
-        help='Number of classes. Defaults to the value stored in the checkpoint.'
     )
     parser.add_argument(
         '--input-size', type=int, default=512,
@@ -111,14 +73,16 @@ def run_predict(argv) -> None:
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
 
+    checkpoint = load_checkpoint(checkpoint)
+    model = UNet2D.from_checkpoint(checkpoint).to(torch.accelerator.current_accelerator(check_available=True) or 'cpu')
+
     predict2d.predict_all_volumes(
         zarr_files,
-        project_path=output,
-        model_path=checkpoint,
+        model,
+        checkpoint['level'],
         predictions_dir=output / 'predictions',
         temp_dir=Path(args.temp_dir) if args.temp_dir else output / 'temp',
         input_size=args.input_size,
-        num_classes=args.num_classes,
         batch_size=args.batch_size,
         overlap=args.overlap,
         axes=axes,

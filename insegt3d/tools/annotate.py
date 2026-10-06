@@ -1,44 +1,39 @@
 import cv2
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor
 
-from insegt3d.app.scheduler import JobSpec
 from insegt3d.tools.base_tool import BaseTool
+from insegt3d.volume.interp import ERASE
+
+BRUSH_MODES = ('draw', 'erase', 'keep')
+MODE_KEYS = {'b': 'draw', 'e': 'erase', 'g': 'mask_fill', 'f': 'flood', 'k': 'keep'}
 
 class AnnotatorTool(BaseTool):
 
     def __init__(self, state, services, renderer, scheduler, callbacks):
         super().__init__(state, services, renderer, scheduler, callbacks)
 
-        # State references
         self.ui = state.ui
         self.annot = state.annot
-        self.pointer = state.pointer
         self.nav = state.nav
         self.camera = state.camera
         self.train = state.train
-        self.slicer = services.slicer
-        self.tracker = services.tracker
+        self.history = services.history
 
         self._prev_mode = None
+        self._erasing = False
 
-        self.path = []
-        self.svg_parts = []
+        self.strokes = []
 
         self._cursor_x = 0
         self._cursor_y = 0
+        self._overlay_hidden = False
 
-        self.write_mask_job = "write_mask"
-
-        self.register_latest_job(self.write_mask_job, self._do_write_mask)
-
-        self.scheduler.register_async(
-            "update_annotation_overlay",
-            fn=self._push_overlay,
-            spec=JobSpec(
-                max_hz=60,
-                mode="latest",
-            ),
-        )
+        edits = ThreadPoolExecutor(max_workers=1)
+        self.scheduler.register_sync("write_mask", self._do_write_mask, mode="queue", executor=edits)
+        self.scheduler.register_sync("undo", self._do_undo, mode="queue", executor=edits)
+        self.scheduler.register_sync("redo", self._do_redo, mode="queue", executor=edits)
+        self.scheduler.register_async("update_annotation_overlay", self._push_overlay, max_hz=60)
 
     async def on_pointer(self, e):
 
@@ -47,14 +42,19 @@ class AnnotatorTool(BaseTool):
             self.annot.brush_size *= factor
             self.callbacks.set_brush_size()
 
-        if not e.ctrl and ((e.mouse and e.button == 0) or e.pen) and e.down:
+        if not e.ctrl and self.annot.mode in BRUSH_MODES and (e.primary or e.eraser) and e.down:
             self.annot.annotating = True
+            self._erasing = e.eraser or self.annot.mode == 'erase'
 
-        if self.annot.annotating and self.annot.mode in ('draw', 'save'):
-            self._handle_stroke(e, saving=self.annot.mode == 'save')
+        if self.annot.annotating and self.annot.mode in BRUSH_MODES:
+            self._handle_stroke(e, keeping=self.annot.mode == 'keep' and not self._erasing)
 
         self._cursor_x, self._cursor_y = e.x, e.y
-        self.scheduler.request("update_annotation_overlay")
+
+        # The brush overlay is hidden while ctrl (navigation) is held
+        if not e.ctrl or e.ctrl != self._overlay_hidden:
+            self.scheduler.request("update_annotation_overlay")
+        self._overlay_hidden = bool(e.ctrl)
 
     async def _push_overlay(self):
         self.renderer.update_svg(self._get_overlay())
@@ -65,121 +65,121 @@ class AnnotatorTool(BaseTool):
 
         if e.action.keydown and e.key == "Shift":
             self._prev_mode = self.annot.mode
-            self.annot.mode = 'save'
-            self.callbacks.set_annotation_mode()
-        if e.action.keyup and e.key == "Shift":
+            self.annot.mode = 'keep'
+            self._abandon_stroke()
+        if e.action.keyup and e.key == "Shift" and self._prev_mode is not None:
             self.annot.mode = self._prev_mode
-            self.callbacks.set_annotation_mode()
+            self._abandon_stroke()
             self._prev_mode = None
 
         if e.modifiers.ctrl and e.action.keydown:
             if e.key == "z":
-                self.slicer.undo()
-                self.tracker.undo()
+                self.scheduler.request("undo")
             elif e.key == "y":
-                self.slicer.redo()
-                self.tracker.redo()
-            self.scheduler.request("nav_hires")
+                self.scheduler.request("redo")
             return
 
-        if e.key == "x" and e.action.keydown:
-            self.annot.previous_color(self.train.num_classes)
-            self.callbacks.refresh_button_palette()
-        elif e.key == "c" and e.action.keydown:
+        if e.key == "c" and e.action.keydown:
             self.annot.next_color(self.train.num_classes)
             self.callbacks.refresh_button_palette()
+        elif e.key.name in MODE_KEYS and e.action.keydown:
+            self.annot.mode = MODE_KEYS[e.key.name]
+            self._abandon_stroke()
+        # Keys 1-9 select classes 1-9, 0 selects class 10
+        elif e.key.number is not None and e.action.keydown and (e.key.number - 1) % 10 < self.train.num_classes:
+            self.callbacks.on_pick_color((e.key.number - 1) % 10)
 
         if e.key == "d" and e.action.keydown:
-            self.ui.prediction.visible = not self.ui.prediction.visible
-            self.callbacks.set_prediction_overlay()
-            self.renderer.update()
+            self.callbacks.toggle_live_prediction()
 
         self.renderer.update_svg(self._get_overlay())
 
-    def _handle_stroke(self, e, saving):
-        
-        p = self.pointer
-        drawing = (e.mouse and e.button == 0) or e.pen
+    def _handle_stroke(self, e, keeping):
+
+        drawing = e.primary or e.eraser
 
         if (drawing and e.down) or ((e.mouse or e.pen) and e.move):
-            self._continue_path(p.x, p.y, e.x, e.y)
+            self._add_point(e.x, e.y)
 
         elif drawing and e.up:
-            self._end_path(saving=saving)
+            self._end_path(keeping=keeping)
             self.annot.annotating = False
 
-    def _continue_path(self, x0, y0, x1, y1):
+    def _abandon_stroke(self):
+        self.annot.annotating = False
+        self.strokes.clear()
+
+    def _add_point(self, x, y):
         a = self.annot
-        r = a.brush_size * 0.5
-        css = a.color_css
+        label = ERASE if self._erasing else a.color_idx + 1
+        # Start a new segment when brush size or class changes, continuing from the last point
+        if not self.strokes or self.strokes[-1][:2] != (a.brush_size, label):
+            start = self.strokes[-1][2][-1] if self.strokes else (x, y)
+            self.strokes.append((a.brush_size, label, [start]))
+        self.strokes[-1][2].append((x, y))
 
-        self.path.append([x0, y0, x1, y1, a.brush_size, a.color_idx])
-        self.svg_parts.append(
-            f'<circle cx="{x0}" cy="{y0}" r="{r}" fill="{css}" stroke="{css}" />'
-            f'<line x1="{x0}" y1="{y0}" x2="{x1}" y2="{y1}" '
-            f'stroke="{css}" stroke-width="{a.brush_size}" fill="none" />'
-        )
-
-    def _end_path(self, saving):
-        mask = self._create_mask(self.path, saving=saving)
-        self.scheduler.request(self.write_mask_job, mask)
-        self.path.clear()
-        self.svg_parts.clear()
+    def _end_path(self, keeping):
+        mask = self._create_mask(self.strokes, keeping=keeping)
+        self.scheduler.request("write_mask", mask, self.camera.copy())
+        self.strokes.clear()
 
     def _get_overlay(self):
+        if self._overlay_hidden:
+            return ''
+
         a = self.annot
         opacity = self.ui.annotation.alpha
 
-        stroke = "".join(self.svg_parts)
+        stroke = "".join(
+            f'<polyline points="{" ".join(f"{x},{y}" for x, y in points)}" fill="none" '
+            f'stroke="{"white" if label == ERASE else a.colors[label - 1]}" stroke-width="{size}" stroke-linecap="round" stroke-linejoin="round" />'
+            for size, label, points in self.strokes
+        )
+        color = 'white' if a.mode == 'erase' else a.colors[a.color_idx]
         cursor = (
             f'<circle cx="{self._cursor_x}" cy="{self._cursor_y}" r="{a.brush_size/2}" '
-            f'fill="{a.color_css}" stroke="{a.color_css}" opacity="{opacity}" />'
+            f'fill="{color}" stroke="{color}" opacity="{opacity}" />'
         )
         return f'<g opacity="{opacity}">{stroke}</g>{cursor}'
 
-    def _do_write_mask(self, mask):
+    def _do_write_mask(self, mask, camera=None):
 
-        if mask is None:
+        if mask is None or self.train.changing_classes:
             return
 
-        h, w = self.nav.slice_shape
-        half_h, half_w = h // 2, w // 2
-        extent = (0, 0, -half_h, half_h, -half_w, half_w)
+        if camera is None:
+            camera = self.camera.copy()
 
-        self.slicer.set_data(self.camera, mask, extent=extent)
-        self.tracker.on_annotation_commit(
-            self.slicer.zarr_path, self.camera, mask, extent
-        )
+        self.history.commit(camera, mask, self.nav.extent)
 
-        self.scheduler.request("nav_hires")
+        self.scheduler.request("nav_overlays")
         self.scheduler.request("live_train")
 
-    def _create_mask(self, path, saving=False):
+    def _do_undo(self):
+        self.history.undo()
+        self.scheduler.request("nav_overlays")
+
+    def _do_redo(self):
+        self.history.redo()
+        self.scheduler.request("nav_overlays")
+
+    def _create_mask(self, strokes, keeping=False):
         slice_h, slice_w = self.nav.slice_shape
         view_h, view_w = self.ui.viewport_shape
 
-        scale_x = slice_w / view_w
-        scale_y = slice_h / view_h
+        scale = np.array([slice_w / view_w, slice_h / view_h])
 
         mask = np.zeros((slice_h, slice_w), np.uint8)
 
-        for i, (x0, y0, x1, y1, brush_size, color_idx) in enumerate(path):
+        for brush_size, label, points in strokes:
+            points = (np.array(points) * scale).astype(np.int32)
+            cv2.polylines(mask, [points], False, label, max(1, int(np.rint(brush_size * scale[1]))))
 
-            x0 = int(x0 * scale_x)
-            x1 = int(x1 * scale_x)
-            y0 = int(y0 * scale_y)
-            y1 = int(y1 * scale_y)
-
-            radius = int(np.rint(brush_size * 0.5))
-            thickness = int(np.rint(brush_size))
-            label = color_idx + 1
-
-            cv2.circle(mask, (x0, y0), radius, label, -1)
-            cv2.line(mask, (x0, y0), (x1, y1), label, thickness)
-            if i == len(path) - 1:
-                cv2.circle(mask, (x1, y1), radius, label, -1)
-
-        if saving:
-            mask = (mask > 0) * self.renderer.prediction_in_viewport()
+        # Keep mode paints the live prediction under the stroke instead of the class
+        if keeping:
+            prediction = self.renderer.prediction_in_viewport(self.camera.version)
+            if prediction is None:
+                return None
+            mask = (mask > 0) * cv2.resize(prediction, (slice_w, slice_h), interpolation=cv2.INTER_NEAREST)
 
         return mask

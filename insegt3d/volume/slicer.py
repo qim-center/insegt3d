@@ -1,584 +1,405 @@
 import cv2
+import time
+import queue
+import shutil
+import concurrent.futures
 import numpy as np
-import threading
 import tensorstore as ts
 from pathlib import Path
 
-from insegt3d.volume.io import read_multiscale_zarr, read_multiscale_masks
+from insegt3d.volume.io import read_multiscale_zarr, read_multiscale_masks, make_ts_context, remap_labels
 from insegt3d.volume.interp import write_nearest, read_nearest, read_trilinear
-from insegt3d.volume.intensity import coarsest_small_level, native_intensity_range, robust_percentile_range
+from insegt3d.volume.intensity import coarsest_small_level, robust_percentile_range
+
+_sample_pool = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+
+def _bounding_box(center, axes, half_extents):
+    extent = sum(np.abs(axis) * half for axis, half in zip(axes, half_extents))
+    return np.floor(center - extent).astype(np.int64), np.ceil(center + extent).astype(np.int64) + 1
+
+def _fitting_level(voxel_sizes, zoom):
+    """Coarsest level whose voxels are no larger than `zoom` on every axis. Level 0 always qualifies."""
+    fits = np.all(voxel_sizes <= np.maximum(zoom, voxel_sizes[0]), axis=1)
+    return int(np.flatnonzero(fits)[-1])
 
 class VolumeSlicer:
 
-    def __init__(self, max_undo=50, cache_size_mb=30000, ts_context=None):
+    def __init__(self, cache_size_mb=16384, ts_context=None):
 
         self.zarr_path = None
         self.mask_path = None
-        self.prediction_path = None
 
         self.images = None
         self.masks = None
         self.predictions = None
         self.shapes = None
+        self.scales = None
+        self.translations = None
+        self.voxel_sizes = None
+        self.offsets = None
 
-        self._intensity_range = None
+        self._fallback = None
 
-        self._pad_cache = {}
-
-        # TensorStore cache settings. 
-        self.ts_context = ts_context if ts_context is not None else ts.Context({
-            'cache_pool': {'total_bytes_limit': int(cache_size_mb * 1024**2)}
-        })
-
-        # Undo/redo (stores sparse volume patches)
-        self._undo_stack = []
-        self._redo_stack = []
-        self._max_undo = max_undo
-        self._edit_lock = threading.Lock()
+        self.ts_context = ts_context if ts_context is not None else make_ts_context(cache_size_mb)
 
     def initialize(self, zarr_path, mask_path, camera, center_camera=False, prediction_path=None):
 
         self.zarr_path = zarr_path
         self.mask_path = mask_path
-        self.prediction_path = prediction_path
 
-        # Reset undo/redo history
-        self._undo_stack.clear()
-        self._redo_stack.clear()
-
-        # Read multiscale volume
-        self.images = read_multiscale_zarr(
+        self.images, self.scales, self.translations = read_multiscale_zarr(
             self.zarr_path,
             ts_context=self.ts_context
         )
+        self.voxel_sizes, self.offsets = self._to_world(self.scales, self.translations)
 
-        # Get shapes
         self.shapes = np.array([image.shape for image in self.images], dtype=int)
 
-        # Only open the mask arrays if a mask zarr already exists
+        # Masks are created on the first annotation (see set_data)
         if mask_path is not None and Path(mask_path).exists():
-            level_shapes = [image.shape for image in self.images]
-            self.masks = read_multiscale_masks(mask_path, level_shapes, ts_context=self.ts_context)
+            self.masks = self.read_masks()
         else:
             self.masks = None
 
-        # Only open the prediction-label pyramid if this volume has already been predicted
-        if prediction_path is not None and Path(prediction_path).exists():
-            self.predictions = read_multiscale_zarr(str(prediction_path), ts_context=self.ts_context)
-        else:
-            self.predictions = None
+        self.predictions = self._load_predictions(prediction_path)
 
         if center_camera:
-            camera.reset(self.shapes[0])
+            camera.reset(self.world_shape)
 
-        self._intensity_range = None
+        self._fallback = None
+
+    def _to_world(self, scales, translations):
+        """Scales and translations in world units (level 0's smallest voxel side), with level 0 at the origin."""
+        unit = self.scales[0].min()
+        return scales / unit, (translations - self.translations[0]) / unit
+
+    @property
+    def world_shape(self):
+        return self.shapes[0] * self.voxel_sizes[0]
+
+    def read_masks(self):
+        return read_multiscale_masks(self.mask_path, [image.shape for image in self.images], self.scales, self.translations, ts_context=self.ts_context)
+
+    def sources(self, levels, mask=False):
+        volumes = self.masks if mask else self.images
+        return [(level, volumes[level], self.voxel_sizes[level], self.offsets[level]) for level in levels]
+
+    @property
+    def fallback(self):
+        """Small level held in memory, drawn first while finer levels load."""
+        if self._fallback is None:
+            level = coarsest_small_level(self.shapes, max_voxels=256 ** 3)
+            self._fallback = (level, np.asarray(self.images[level]), self.voxel_sizes[level], self.offsets[level])
+        return self._fallback
+
+    def reset_masks(self, masks_root):
+        shutil.rmtree(masks_root, ignore_errors=True)
+        # A fresh context drops cached chunks of the deleted masks
+        self.ts_context = ts.Context(self.ts_context.spec)
+        self.masks = None
+
+    def relabel_masks(self, masks_root, lut):
+        remap_labels(masks_root, lut)
+        self.ts_context = ts.Context(self.ts_context.spec)
+        if self.masks is not None:
+            self.masks = self.read_masks()
 
     @property
     def has_prediction(self):
         return self.predictions is not None
 
-    def refresh_prediction(self, prediction_path=None):
-        """
-        (Re)loads the prediction-label pyramid without touching the image,
-        mask, or undo/redo state
-        """
-        if prediction_path is not None:
-            self.prediction_path = prediction_path
+    def refresh_prediction(self, prediction_path):
+        self.predictions = self._load_predictions(prediction_path)
 
-        if self.prediction_path is not None and Path(self.prediction_path).exists():
-            self.predictions = read_multiscale_zarr(str(self.prediction_path), ts_context=self.ts_context)
-        else:
-            self.predictions = None
-
-    def get_intensity_range(self, max_dim=128):
-
-        if not self.images:
+    def _load_predictions(self, prediction_path):
+        if prediction_path is None or not Path(prediction_path).exists():
             return None
 
-        if self._intensity_range is None:
-            level = coarsest_small_level(self.shapes, max_voxels=max_dim ** 3)
-            self._intensity_range = native_intensity_range(self.images[level])
+        predictions, scales, translations = read_multiscale_zarr(str(prediction_path), ts_context=self.ts_context, recheck="open")
+        return (predictions, *self._to_world(scales, translations))
 
-        return self._intensity_range
-
-    def get_robust_intensity_range(self, max_dim=128):
-        """
-        Robust intensity window (0.5th-99.5th percentile) for the currently
-        loaded volume, used as the default contrast window.
-        """
-        if not self.images:
-            return None
-
-        level = coarsest_small_level(self.shapes, max_voxels=max_dim ** 3)
-        volume = np.asarray(self.images[level])
-        return robust_percentile_range(volume)
-
-    def compute_histogram(self, max_dim=128, bins=256):
-
-        if not self.images:
-            return None, None
-
-        level = coarsest_small_level(self.shapes, max_voxels=max_dim ** 3)
-        volume = np.asarray(self.images[level])
-
-        value_range = self.get_intensity_range(max_dim=max_dim)
+    def intensity_stats(self, max_dim=128, bins=256):
+        volume = np.asarray(self.images[coarsest_small_level(self.shapes, max_voxels=max_dim ** 3)])
+        value_range = float(volume.min()), float(volume.max())
         counts, _ = np.histogram(volume, bins=bins, range=value_range)
+        return counts, value_range, robust_percentile_range(volume)
 
-        return counts, value_range
+    @staticmethod
+    def apply_patches(patches, undo):
+        for vol, box, index, before, after in (reversed(patches) if undo else patches):
+            sub = np.ascontiguousarray(vol[box])
+            sub.flat[index] = before if undo else after
+            vol[box] = sub
 
-    def _add_to_history(self, edit):
-
-        if not edit:
-            return
-
-        self._undo_stack.append(edit)
-
-        if len(self._undo_stack) > self._max_undo:
-            self._undo_stack.pop(0)
-
-        self._redo_stack.clear()
-
-    def _apply_edit(self, edit, which):
-
-        patches = edit[::-1] if which == "before" else edit
-
-        for level, is_mask, (i0, i1, j0, j1, k0, k1), before, after in patches:
-            vol = self.masks[level] if is_mask else self.images[level]
-            vol[i0:i1, j0:j1, k0:k1] = (before if which == "before" else after)
-
-    def undo(self):
-        """
-        Undo the most recent set_data() call.
-        """
-        with self._edit_lock:
-            if not self._undo_stack:
-                return False
-            edit = self._undo_stack.pop()
-            self._apply_edit(edit, "before")
-            self._redo_stack.append(edit)
-            return True
-
-    def redo(self):
-        """
-        Redo the most recently undone set_data() call.
-        """
-        with self._edit_lock:
-            if not self._redo_stack:
-                return False
-            edit = self._redo_stack.pop()
-            self._apply_edit(edit, "after")
-            self._undo_stack.append(edit)
-            return True
+    def level(self, zoom, level_modifier=0):
+        return _fitting_level(self.voxel_sizes, zoom * 2.0 ** level_modifier)
 
     def get_data(
         self,
         camera,
-        extent=(0, 0, -256, 256, -256, 256),
-        out_shape=None,
-        level_modifier=0,
-        scale_depth=False,
+        extent,
+        out_shape,
         mask=False,
         prediction=False,
         order=0,
-        axis=0,
         zoom_override=None,
-        tile_hw=64,
+        level=None,
     ):
-        """
-        Tiled sampler.
-        Returns:
-        (H,W) if D==1 else (D,H,W)
-        """
+        """Samples `extent` (d0, d1, top, bottom, left, right in slice pixels) around the camera, as (D, H, W) or (H, W) if D == 1."""
 
+        dtype = np.uint8 if mask or prediction else np.float32
         if self.images is None:
-            # No volume loaded yet -- nothing to sample.
-            H, W = out_shape[-2:] if out_shape else (1, 1)
-            output = np.zeros((1, H, W), dtype=np.float32)
-            return output[0]
+            return np.zeros(out_shape[-2:], dtype=dtype)
 
         zoom = zoom_override if zoom_override is not None else camera.zoom
+        level = self.level(zoom) if level is None else level
 
-        num_levels = len(self.images)
-        base_level = int(np.floor(np.log2(max(zoom, 1e-8))))
-        level = int(np.clip(base_level + level_modifier, 0, num_levels - 1))
+        D = max(1, int(np.ceil(extent[1] - extent[0])))
+        D, H, W = out_shape if len(out_shape) == 3 else (D, *out_shape)
+        output = np.zeros((D, H, W), dtype=dtype)
 
-        d0, d1, top, bottom, left, right = map(float, extent)
-
-        raw_D = max(1, int(np.ceil(d1 - d0)))
-        raw_H = max(1, int(np.ceil(bottom - top)))
-        raw_W = max(1, int(np.ceil(right - left)))
-
-        if out_shape is None:
-            D, H, W = raw_D, raw_H, raw_W
-        else:
-            if len(out_shape) == 2:
-                H, W = map(int, out_shape)
-                D = raw_D
-            elif len(out_shape) == 3:
-                D, H, W = map(int, out_shape)
-            else:
-                raise ValueError("out_shape must be None, (H,W), or (D,H,W).")
-
-        D = max(1, int(D))
-        H = max(1, int(H))
-        W = max(1, int(W))
-
-        if mask and self.masks is None:
-            output = np.zeros((D, H, W), dtype=np.float32)
-            return output[0] if D == 1 else output
-
-        if prediction and self.predictions is None:
-            output = np.zeros((D, H, W), dtype=np.float32)
+        if (mask and self.masks is None) or (prediction and self.predictions is None):
             return output[0] if D == 1 else output
 
         if prediction:
-            volume = self.predictions[min(level, len(self.predictions) - 1)]
+            volumes, voxel_sizes, offsets = self.predictions
+            level = _fitting_level(voxel_sizes, zoom)
+            sources = [(level, volumes[level], voxel_sizes[level], offsets[level])]
         else:
-            volume = self.masks[level] if mask else self.images[level]
+            sources = self.sources([level], mask=mask)
 
-        s_view = zoom / (2 ** level)
-
-        if scale_depth:
-            sd0 = d0 * s_view
-            sd1 = d1 * s_view
-        else:
-            sd0, sd1 = d0, d1
-
-        stop    = top * s_view
-        sbottom = bottom * s_view
-        sleft   = left * s_view
-        sright  = right * s_view
-
-        dd = 0.0 if D == 1 else (sd1 - sd0) / (D - 1)
-        dy = 0.0 if H == 1 else (sbottom - stop) / (H - 1)
-        dx = 0.0 if W == 1 else (sright - sleft) / (W - 1)
-
-        normal_axis, a0, a1 = camera.slice_axes(axis=axis)
-
-        origin = (camera.origin / (2 ** level)).astype(np.float32)
-
-        pad = 1 if order == 1 else 0
-
-        scale = float(2 ** level)
-        inv_scale = 1.0 / scale
-
-        Is, Js, Ks = volume.shape
-
-        output = np.zeros((D, H, W), dtype=np.float32)
-
-        th = tw = max(8, int(tile_hw))
-
-        def depth_samples_for_bounds():
-            if pad == 0 and D == 1:
-                return (sd0,)
-            return (sd0 - pad, sd0 + (D - 1) * dd + pad)
-
-        ds_bounds = depth_samples_for_bounds()
-
-        for y0 in range(0, H, th):
-            h_tile = min(th, H - y0)
-            y_start = stop + y0 * dy
-            y_end   = y_start + (h_tile - 1) * dy if h_tile > 1 else y_start
-
-            for x0 in range(0, W, tw):
-                w_tile = min(tw, W - x0)
-                x_start = sleft + x0 * dx
-                x_end   = x_start + (w_tile - 1) * dx if w_tile > 1 else x_start
-
-                corners = []
-                if pad == 0 and D == 1:
-                    for y in (y_start, y_end):
-                        for x in (x_start, x_end):
-                            p0 = camera.world_coords(sd0 * scale, y * scale, x * scale)
-                            corners.append(p0 * inv_scale)
-                else:
-                    for d in ds_bounds:
-                        for y in (y_start - pad, y_end + pad):
-                            for x in (x_start - pad, x_end + pad):
-                                p0 = camera.world_coords(d * scale, y * scale, x * scale)
-                                corners.append(p0 * inv_scale)
-
-                pts = np.stack(corners, axis=0)
-                if not np.isfinite(pts).all():
-                    continue
-
-                mn = np.floor(pts.min(axis=0)).astype(np.int64)
-                mx = (np.ceil(pts.max(axis=0)).astype(np.int64) + 1)
-
-                i0_raw, j0_raw, k0_raw = mn
-                i1_raw, j1_raw, k1_raw = mx
-
-                if i1_raw <= 0 or i0_raw >= Is or j1_raw <= 0 or j0_raw >= Js or k1_raw <= 0 or k0_raw >= Ks:
-                    continue
-
-                if (0 <= i0_raw) and (i1_raw <= Is) and (0 <= j0_raw) and (j1_raw <= Js) and (0 <= k0_raw) and (k1_raw <= Ks):
-                    i0, i1 = int(i0_raw), int(i1_raw)
-                    j0, j1 = int(j0_raw), int(j1_raw)
-                    k0, k1 = int(k0_raw), int(k1_raw)
-
-                    subvol = np.ascontiguousarray(volume[i0:i1, j0:j1, k0:k1])
-                    if subvol.dtype != np.float32:
-                        subvol = subvol.astype(np.float32, copy=False)
-
-                    shift = np.array([i0, j0, k0], dtype=np.float32)
-                    local_origin = origin - shift
-
-                else:
-                    i0 = max(0, int(i0_raw))
-                    i1 = min(Is, int(i1_raw))
-                    j0 = max(0, int(j0_raw))
-                    j1 = min(Js, int(j1_raw))
-                    k0 = max(0, int(k0_raw))
-                    k1 = min(Ks, int(k1_raw))
-                    if i1 <= i0 or j1 <= j0 or k1 <= k0:
-                        continue
-
-                    Pi = int(i1_raw - i0_raw)
-                    Pj = int(j1_raw - j0_raw)
-                    Pk = int(k1_raw - k0_raw)
-                    if Pi <= 0 or Pj <= 0 or Pk <= 0:
-                        continue
-
-                    key = (Pi, Pj, Pk)
-                    buf = self._pad_cache.get(key)
-                    if buf is None:
-                        buf = np.zeros(key, dtype=np.float32)
-                        self._pad_cache[key] = buf
-                    else:
-                        buf.fill(0.0)
-
-                    sub = np.ascontiguousarray(volume[i0:i1, j0:j1, k0:k1])
-                    if sub.dtype != np.float32:
-                        sub = sub.astype(np.float32, copy=False)
-
-                    oi = int(i0 - i0_raw)
-                    oj = int(j0 - j0_raw)
-                    ok = int(k0 - k0_raw)
-                    buf[oi:oi + sub.shape[0], oj:oj + sub.shape[1], ok:ok + sub.shape[2]] = sub
-
-                    subvol = buf
-                    shift_raw = np.array([i0_raw, j0_raw, k0_raw], dtype=np.float32)
-                    local_origin = origin - shift_raw
-
-                out_tile = output[:, y0:y0 + h_tile, x0:x0 + w_tile]
-
-                if order == 0:
-                    read_nearest(
-                        subvol, out_tile,
-                        local_origin, normal_axis, a0, a1,
-                        sd0, dd, y_start, dy, x_start, dx
-                    )
-                elif order == 1:
-                    read_trilinear(
-                        subvol, out_tile,
-                        local_origin, normal_axis, a0, a1,
-                        sd0, dd, y_start, dy, x_start, dx
-                    )
-                else:
-                    raise ValueError(f"Unsupported interpolation order={order}. Use 0 or 1.")
+        for _ in self.stream(camera, output, sources, extent, zoom=zoom, order=order):
+            pass
 
         return output[0] if D == 1 else output
 
-    def set_data(
+    def stream(
         self,
         camera,
-        data,
-        extent=(0, 0, -256, 256, -256, 256),
-        out_shape=None,
-        level_modifier=0,
-        scale_depth=False,
-        mask=True,
-        axis=0,
-        zoom_override=None,
-        tile_hw=64,
+        output,
+        sources,
+        extent,
+        zoom=None,
+        keep_level=None,
+        deadline=None,
         order=0,
-        thickness=2,
+        tile_hw=128,
+        max_inflight=256,
     ):
         """
-        Tiled writer.
-        Writes to level 0.
+        Generator that fills `output` from `sources` tile by tile, yielding as reads complete.
+        Later sources take priority, and each source's tiles are read centre-first. Stops after
+        `deadline`. Reads that are superseded or unfinished are cancelled below `keep_level`.
         """
+        zoom = zoom if zoom is not None else camera.zoom
+
+        d0, d1, top, bottom, left, right = (float(value) * zoom for value in extent)
+        D, H, W = output.shape
+
+        dd = 0.0 if D == 1 else (d1 - d0) / (D - 1)
+        dy = 0.0 if H == 1 else (bottom - top) / (H - 1)
+        dx = 0.0 if W == 1 else (right - left) / (W - 1)
+
+        th = tw = max(8, int(tile_hw))
+
+        tiles = []
+
+        for rank, (level, volume, voxel_size, offset) in enumerate(sources):
+
+            axes = tuple((axis / voxel_size).astype(np.float32) for axis in camera.uvw)
+            origin = ((camera.origin - offset) / voxel_size).astype(np.float32)
+            pad = float(voxel_size.max()) if order == 1 else 0.0
+
+            Is, Js, Ks = volume.shape
+
+            d_lo, d_hi = (d0, d0) if pad == 0 and D == 1 else (d0 - pad, d0 + (D - 1) * dd + pad)
+
+            for y0 in range(0, H, th):
+                h_tile = min(th, H - y0)
+                y_start = top + y0 * dy
+                y_end   = y_start + (h_tile - 1) * dy
+
+                for x0 in range(0, W, tw):
+                    w_tile = min(tw, W - x0)
+                    x_start = left + x0 * dx
+                    x_end   = x_start + (w_tile - 1) * dx
+
+                    center = origin + (d_lo + d_hi) / 2 * axes[0] + (y_start + y_end) / 2 * axes[1] + (x_start + x_end) / 2 * axes[2]
+                    half_extents = (abs(d_hi - d_lo) / 2, abs(y_end - y_start) / 2 + pad, abs(x_end - x_start) / 2 + pad)
+                    mn, mx = _bounding_box(center, axes, half_extents)
+
+                    i0_raw, j0_raw, k0_raw = mn
+                    i1_raw, j1_raw, k1_raw = mx
+
+                    if i1_raw <= 0 or i0_raw >= Is or j1_raw <= 0 or j0_raw >= Js or k1_raw <= 0 or k0_raw >= Ks:
+                        continue
+
+                    i0, i1 = max(0, int(i0_raw)), min(Is, int(i1_raw))
+                    j0, j1 = max(0, int(j0_raw)), min(Js, int(j1_raw))
+                    k0, k1 = max(0, int(k0_raw)), min(Ks, int(k1_raw))
+
+                    # Tiles crossing the volume edge are read clipped and zero-padded back to full size
+                    if (i0, i1, j0, j1, k0, k1) == (i0_raw, i1_raw, j0_raw, j1_raw, k0_raw, k1_raw):
+                        padding = None
+                    else:
+                        padding = ((int(i1_raw - i0_raw), int(j1_raw - j0_raw), int(k1_raw - k0_raw)), i0 - int(i0_raw), j0 - int(j0_raw), k0 - int(k0_raw))
+
+                    local_origin = origin - np.array([i0_raw, j0_raw, k0_raw], dtype=np.float32)
+                    out_tile = output[:, y0:y0 + h_tile, x0:x0 + w_tile]
+                    distance = (y0 + h_tile / 2 - H / 2) ** 2 + (x0 + w_tile / 2 - W / 2) ** 2
+                    grid = axes + (d0, dd, y_start, dy, x_start, dx)
+
+                    tiles.append(((rank, distance), (y0, x0), level, volume[i0:i1, j0:j1, k0:k1], out_tile, local_origin, padding, grid))
+
+        tiles.sort(key=lambda tile: tile[0])
+
+        done = queue.Queue()
+        futures = {}
+        drawn = {}
+        issued = 0
+
+        def draw(item):
+            _, i, subvol = item
+            _, _, _, _, out_tile, local_origin, padding, grid = tiles[i]
+
+            if not isinstance(subvol, np.ndarray):
+                subvol = subvol.result()
+            subvol = np.ascontiguousarray(subvol, dtype=output.dtype)
+
+            if padding is not None:
+                shape, oi, oj, ok = padding
+                buf = np.zeros(shape, dtype=output.dtype)
+                buf[oi:oi + subvol.shape[0], oj:oj + subvol.shape[1], ok:ok + subvol.shape[2]] = subvol
+                subvol = buf
+
+            sampler = read_nearest if order == 0 else read_trilinear
+            sampler(subvol, out_tile, local_origin, *grid)
+
+        try:
+            while futures or issued < len(tiles):
+
+                while issued < len(tiles) and len(futures) < max_inflight:
+                    region = tiles[issued][3]
+                    if isinstance(region, np.ndarray):
+                        futures[issued] = region
+                        done.put(issued)
+                    else:
+                        futures[issued] = region.read()
+                        futures[issued].add_done_callback(lambda _, i=issued: done.put(i))
+                    issued += 1
+
+                late = deadline is not None and time.time() >= deadline
+                wait = 0.1 if deadline is None else max(0.0, min(0.1, deadline - time.time()))
+
+                ready = []
+                try:
+                    ready.append(done.get(timeout=wait))
+                except queue.Empty:
+                    pass
+                while not done.empty():
+                    ready.append(done.get_nowait())
+
+                # Per output tile, draw only the highest-priority read that improves on what is drawn
+                best = {}
+                for i in ready:
+                    (rank, _), key = tiles[i][0], tiles[i][1]
+                    subvol = futures.pop(i, None)
+                    if subvol is not None and rank > max(drawn.get(key, -1), best.get(key, (-1,))[0]):
+                        best[key] = (rank, i, subvol)
+
+                for key, (rank, _, _) in best.items():
+                    drawn[key] = rank
+
+                list(_sample_pool.map(draw, sorted(best.values(), key=lambda b: tiles[b[1]][0][1])))
+
+                # Drop reads that can no longer improve their tile, cancelling those below keep_level
+                for i in [i for i in futures if tiles[i][0][0] <= drawn.get(tiles[i][1], -1)]:
+                    future = futures.pop(i)
+                    if isinstance(future, ts.Future) and (keep_level is None or tiles[i][2] < keep_level):
+                        future.cancel()
+
+                yield
+
+                if late:
+                    return
+        finally:
+            for i, future in futures.items():
+                if isinstance(future, ts.Future) and (keep_level is None or tiles[i][2] < keep_level):
+                    future.cancel()
+
+    def set_data(self, camera, data, extent, tile_hw=64, thickness=2):
+        """Writes the 2D `data` into every mask level and returns the changed voxels as undo patches."""
 
         if self.images is None:
-            return
+            return []
 
-        zoom = zoom_override if zoom_override is not None else camera.zoom
-        num_levels = len(self.images)
-        base_level = int(np.floor(np.log2(max(float(zoom), 1e-8))))
-        view_level = int(np.clip(base_level + level_modifier, 0, num_levels - 1))
+        if self.masks is None:
+            self.masks = self.read_masks()
 
-        if mask and self.masks is None:
-            level_shapes = [image.shape for image in self.images]
-            self.masks = read_multiscale_masks(self.mask_path, level_shapes, ts_context=self.ts_context)
+        _, _, top, bottom, left, right = map(float, extent)
+        H, W = max(1, int(np.ceil(bottom - top))), max(1, int(np.ceil(right - left)))
 
-        L = 0
-        vol = self.masks[L] if mask else self.images[L]
+        zoom = float(camera.zoom)
+        top, left = top * zoom, left * zoom
+        dy = 0.0 if H == 1 else (bottom * zoom - top) / (H - 1)
+        dx = 0.0 if W == 1 else (right * zoom - left) / (W - 1)
 
-        d0, d1, top, bottom, left, right = map(float, extent)
-
-        data = np.asarray(data)
-        if data.ndim == 2:
-            data = np.repeat(data[None, ...], int(thickness), axis=0)
-            d0 = -0.5 * float(thickness)
-            d1 =  0.5 * float(thickness)
-
-        if data.ndim != 3:
-            raise ValueError("data must be 2D (H,W) or 3D (D,H,W).")
-
-        D_in, H_in, W_in = map(int, data.shape)
-
-        raw_D = max(1, int(np.ceil(d1 - d0)))
-        raw_H = max(1, int(np.ceil(bottom - top)))
-        raw_W = max(1, int(np.ceil(right - left)))
-
-        if out_shape is None:
-            Dg, Hg, Wg = raw_D, raw_H, raw_W
-        else:
-            if len(out_shape) == 2:
-                Hg, Wg = map(int, out_shape)
-                Dg = raw_D
-            elif len(out_shape) == 3:
-                Dg, Hg, Wg = map(int, out_shape)
-            else:
-                raise ValueError("out_shape must be None, (H,W), or (D,H,W).")
-
-        Dg = max(1, int(Dg))
-        Hg = max(1, int(Hg))
-        Wg = max(1, int(Wg))
-
-        s_view = float(zoom) / (2 ** view_level)
-
-        if scale_depth:
-            sd0 = d0 * s_view
-            sd1 = d1 * s_view
-        else:
-            sd0, sd1 = d0, d1
-
-        stop    = top * s_view
-        sbottom = bottom * s_view
-        sleft   = left * s_view
-        sright  = right * s_view
-
-        to_level0 = float(2 ** view_level)
-
-        if scale_depth:
-            d0_0 = sd0 * to_level0
-            d1_0 = sd1 * to_level0
-        else:
-            d0_0, d1_0 = sd0, sd1
-
-        top_0    = stop    * to_level0
-        bottom_0 = sbottom * to_level0
-        left_0   = sleft   * to_level0
-        right_0  = sright  * to_level0
-
-        dd = 0.0 if Dg == 1 else (d1_0 - d0_0) / (Dg - 1)
-        dy = 0.0 if Hg == 1 else (bottom_0 - top_0) / (Hg - 1)
-        dx = 0.0 if Wg == 1 else (right_0 - left_0) / (Wg - 1)
-
-        if (D_in, H_in, W_in) != (Dg, Hg, Wg):
-            data0 = np.empty((Dg, Hg, Wg), np.uint8)
-            z_map = None if D_in == Dg else np.rint(np.linspace(0, D_in - 1, Dg)).astype(np.int64)
-            for zi in range(Dg):
-                src_z = zi if z_map is None else int(z_map[zi])
-                data0[zi] = cv2.resize(
-                    data[src_z].astype(np.uint8, copy=False),
-                    (Wg, Hg),
-                    interpolation=cv2.INTER_NEAREST,
-                )
-        else:
-            data0 = data.astype(np.uint8, copy=False)
-
-        normal_axis, a0, a1 = camera.slice_axes(axis=axis)
-        origin = camera.origin.astype(np.float32)
-
-        if order != 0:
-            raise ValueError(
-                f"Unsupported interpolation order={order} for set_data. "
-                "Currently only order=0 (nearest) is implemented."
-            )
-
-        pad = 0
-
-        Is, Js, Ks = vol.shape
-
-        edit = []
-
-        def depth_samples_for_bounds():
-            if pad == 0 and Dg == 1:
-                return (d0_0,)
-            return (d0_0 - pad, d0_0 + (Dg - 1) * dd + pad)
-
-        ds_bounds = depth_samples_for_bounds()
-
-        def _clip(i0, i1, j0, j1, k0, k1):
-            i0 = max(0, min(Is, int(i0)))
-            j0 = max(0, min(Js, int(j0)))
-            k0 = max(0, min(Ks, int(k0)))
-            i1 = min(Is, int(i1))
-            j1 = min(Js, int(j1))
-            k1 = min(Ks, int(k1))
-            if i1 <= i0:
-                i1 = min(Is, i0 + 1)
-            if j1 <= j0:
-                j1 = min(Js, j0 + 1)
-            if k1 <= k0:
-                k1 = min(Ks, k0 + 1)
-            return i0, i1, j0, j1, k0, k1
+        mask = cv2.resize(np.asarray(data, dtype=np.uint8), (W, H), interpolation=cv2.INTER_NEAREST)
+        data0 = np.repeat(mask[None], thickness, axis=0)
 
         step = max(1, tile_hw - 1)
-        for y0 in range(0, Hg, step):
-            h_tile = min(tile_hw, Hg - y0)
-            y_start = top_0 + y0 * dy
-            y_end   = y_start + (h_tile - 1) * dy if h_tile > 1 else y_start
+        tiles = [
+            (y0, x0, min(tile_hw, H - y0), min(tile_hw, W - x0))
+            for y0 in range(0, H, step) for x0 in range(0, W, step)
+            if mask[y0:y0 + tile_hw, x0:x0 + tile_hw].any()
+        ]
 
-            for x0 in range(0, Wg, step):
-                w_tile = min(tile_hw, Wg - x0)
-                x_start = left_0 + x0 * dx
-                x_end   = x_start + (w_tile - 1) * dx if w_tile > 1 else x_start
+        def write_level(level):
+            voxel_size, offset = self.voxel_sizes[level], self.offsets[level]
+            vol = self.masks[level]
+            shape = np.array(vol.shape, dtype=np.int64)
+            shard = vol.chunk_layout.write_chunk.shape[-3:]
+            axes = tuple((axis / voxel_size).astype(np.float32) for axis in camera.uvw)
+            origin = ((camera.origin - offset) / voxel_size).astype(np.float32)
+            dd = np.linalg.norm(voxel_size * camera.u) / np.linalg.norm(camera.u)
+            grid = tuple((axis * voxel_size).astype(np.float32) for axis in camera.uvw) + (-0.5 * (thickness - 1) * dd, dd, top, dy, left, dx)
 
-                tile = data0[:, y0:y0 + h_tile, x0:x0 + w_tile]
-                if tile.max() == 0:
+            blocks = {}
+
+            for y0, x0, h_tile, w_tile in tiles:
+                y_start = top + y0 * dy
+                y_end   = y_start + (h_tile - 1) * dy
+                x_start = left + x0 * dx
+                x_end   = x_start + (w_tile - 1) * dx
+
+                center = origin + (y_start + y_end) / 2 * axes[1] + (x_start + x_end) / 2 * axes[2]
+                half_extents = ((thickness - 1) / 2 * dd, abs(y_end - y_start) / 2, abs(x_end - x_start) / 2)
+                mn, mx = _bounding_box(center, axes, half_extents)
+                mn, mx = np.maximum(mn, 0), np.minimum(mx, shape)
+
+                if np.any(mx <= mn):
                     continue
 
-                corners = []
-                if pad == 0 and Dg == 1:
-                    for y in (y_start, y_end):
-                        for x in (x_start, x_end):
-                            corners.append(camera.world_coords(d0_0, y, x))
-                else:
-                    for d in ds_bounds:
-                        for y in (y_start - pad, y_end + pad):
-                            for x in (x_start - pad, x_end + pad):
-                                corners.append(camera.world_coords(d, y, x))
+                # Merge tiles starting in the same shard into one read-modify-write box
+                key = tuple(mn // shard)
+                block = blocks.get(key)
+                blocks[key] = (mn, mx) if block is None else (np.minimum(block[0], mn), np.maximum(block[1], mx))
 
-                pts = np.stack(corners, axis=0)
-                mn = np.floor(pts.min(axis=0)).astype(np.int64)
-                mx = (np.ceil(pts.max(axis=0)).astype(np.int64) + 1)
+            patches = []
 
-                i0, j0, k0 = mn
-                i1, j1, k1 = mx
-                i0, i1, j0, j1, k0, k1 = _clip(i0, i1, j0, j1, k0, k1)
+            for mn, mx in blocks.values():
+                box = tuple(slice(int(i), int(j)) for i, j in zip(mn, mx))
 
-                with self._edit_lock:
-                    sub = np.ascontiguousarray(vol[i0:i1, j0:j1, k0:k1])
-                    before = sub.copy()
+                sub = np.ascontiguousarray(vol[box])
+                before = sub.copy()
 
-                    local_origin = origin - np.array([i0, j0, k0], dtype=np.float32)
+                write_nearest(sub, data0, (origin - mn).astype(np.float32), *grid)
 
-                    write_nearest(
-                        sub, tile,
-                        local_origin, normal_axis, a0, a1,
-                        d0_0, dd,
-                        y_start, dy,
-                        x_start, dx,
-                    )
+                changed = np.flatnonzero(sub != before)
+                if changed.size:
+                    vol[box] = sub
+                    patches.append((vol, box, changed, before.flat[changed], sub.flat[changed]))
 
-                    after = sub.copy()
-                    vol[i0:i1, j0:j1, k0:k1] = sub
+            return patches
 
-                edit.append((0, mask, (i0, i1, j0, j1, k0, k1), before, after))
-
-        # Add edit to history
-        with self._edit_lock:
-            self._add_to_history(edit)
+        return [patch for level in range(len(self.masks)) for patch in write_level(level)]

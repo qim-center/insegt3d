@@ -14,7 +14,11 @@ The OME-Zarr format allows efficient and low-RAM annotation of large 3D volumes.
 - A CUDA GPU or an Apple Silicon Mac is strongly recommended (training and prediction fall back to CPU, but will be VERY slow). Intel Macs are not supported. On a Mac the GPU shares the system memory, so lower `--cache_gb` to leave room for it
 - Data stored as multiscale OME-Zarr 0.5 (Zarr v3) - see [Preparing data](docs/preparing-data.md)
 
-## Installation with conda
+## Installation
+
+Pick one of the options below. They all install the same package. The uv options require [uv](https://docs.astral.sh/uv/), which you can install by following its [installation guide](https://docs.astral.sh/uv/getting-started/installation/).
+
+### conda
 
 Create and activate a conda environment named `insegt3d`, then install the package:
 
@@ -24,10 +28,31 @@ conda activate insegt3d
 pip install git+https://github.com/qim-center/insegt3d
 ```
 
-## Quick start
+### uv virtual environment
+
+Create and activate a virtual environment in the current folder, then install the package:
 
 ```bash
-conda activate insegt3d
+uv venv --python 3.13
+source .venv/bin/activate
+uv pip install git+https://github.com/qim-center/insegt3d
+```
+
+### uv tool
+
+Install InSegt3D into its own isolated environment and put the `insegt3d` command on your PATH, so there is nothing to activate:
+
+```bash
+uv tool install --python 3.13 git+https://github.com/qim-center/insegt3d
+```
+
+Update to the latest version with `uv tool upgrade insegt3d`, or remove it with `uv tool uninstall insegt3d`. If the `insegt3d` command is not found afterwards, run `uv tool update-shell` and restart your terminal.
+
+## Quick start
+
+Activate the environment you installed into (`conda activate insegt3d`, or `source .venv/bin/activate` from the folder where you created it). If you installed with `uv tool` there is nothing to activate. Then run:
+
+```bash
 insegt3d --project_folder "path/to/project_folder"
 ```
 

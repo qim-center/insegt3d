@@ -56,7 +56,7 @@ Activate the environment you installed into (`conda activate insegt3d`, or `sour
 insegt3d --project_folder "path/to/project_folder"
 ```
 
-This creates the project folder if it does not exist, starts a server on a random free port, and prints a link to open in any web browser.
+This creates the project folder if it does not exist, starts a server on a random free port, and prints a link to open in any web browser. To run InSegt3D on a remote machine or HPC cluster and use it from your own browser, see [Remote access](docs/remote-access.md).
 
 In the interface:
 

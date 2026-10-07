@@ -195,10 +195,16 @@ def attach_pointer_event(element, event_name: str):
         }});
     }};
 
+    // Double clicks are detected from presses, since macOS treats ctrl + click as a right click and sends no dblclick
+    let lastDown = null;
+
     target.addEventListener('pointerdown', (ev) => {{
         target.setPointerCapture(ev.pointerId);
         updateActive(ev);
-        emit('down', ev);
+        const double = !!lastDown && ev.button === lastDown.button && ev.timeStamp - lastDown.timeStamp < 500
+            && Math.hypot(ev.clientX - lastDown.clientX, ev.clientY - lastDown.clientY) < 5;
+        lastDown = double ? null : ev;
+        emit('down', ev, {{ double }});
     }});
 
     // Moves are coalesced to one per animation frame

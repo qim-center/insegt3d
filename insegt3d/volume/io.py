@@ -57,15 +57,15 @@ def url_id(url, length=10):
     return token[:length]
 
 def volume_folder_name(zarr_ref):
-    """<stem>__<hash> for local paths and <last URL component>__<hash> for URLs, unique per location."""
+    """<stem>__<hash>.zarr for local paths and <last URL component>__<hash>.zarr for URLs, unique per location."""
     zarr_ref = normalize_zarr_path(zarr_ref)
 
     if is_http_url(zarr_ref):
         last = urlparse(zarr_ref).path.rstrip("/").split("/")[-1] or "remote"
-        return f"{last}__{url_id(zarr_ref)}"
+        return f"{last}__{url_id(zarr_ref)}.zarr"
 
     path = Path(zarr_ref).resolve()
-    return f"{path.stem}__{url_id(str(path))}"
+    return f"{path.stem}__{url_id(str(path))}.zarr"
 
 def resolve_zarr_inputs(data_path):
     """Zarr volumes in data_path: a single store, every store in a folder, or comma-separated http(s) URLs."""

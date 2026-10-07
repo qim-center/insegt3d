@@ -350,6 +350,10 @@ class CallbackManager:
         checkbox = self.ui.checkbox_prediction_overlay
         checkbox.value = not checkbox.value
 
+    def toggle_crosshair(self):
+        checkbox = self.ui.checkbox_crosshair
+        checkbox.value = not checkbox.value
+
     def align_view(self, axis):
         self.camera.set_view(self.camera.origin, self.camera.zoom, AXIS_VIEWS[axis])
         self._request_slice_update()

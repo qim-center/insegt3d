@@ -23,7 +23,7 @@ def build_predict_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         '--output', type=str, required=True,
-        help='Output directory. Predictions are written to <output>/predictions/<volume_name>.'
+        help='Output directory. Predictions are written to <output>/predictions/<volume_name>.zarr.'
     )
     parser.add_argument(
         '--input-size', type=int, default=512,

@@ -39,6 +39,8 @@ class NavigatorTool(BaseTool):
                 self.panning = (e.button == 0)
                 self.rotating = (e.button == 1)
                 self.scrolling = (e.button == 2)
+                if e.double and e.button == 0:
+                    self._recenter(e.x, e.y)
 
             if e.move:
                 if self.panning:
@@ -108,6 +110,14 @@ class NavigatorTool(BaseTool):
                 self.callbacks.align_view(e.key.name)
             elif e.key in (",", "."):
                 self.callbacks.step_plane(1 if e.key == "." else -1)
+            elif e.key == "h":
+                self.callbacks.toggle_crosshair()
+
+    def _recenter(self, x, y):
+        """Pans the view so the point at viewport pixel (x, y) is in the middle."""
+        (slice_h, slice_w), (view_h, view_w) = self.state.nav.slice_shape, self.state.ui.viewport_shape
+        self.state.camera.pan((x - view_w / 2) * slice_w / view_w, (y - view_h / 2) * slice_h / view_h)
+        self._request_hires()
 
     def _request_preview(self):
         self.scheduler.request("nav_preview")

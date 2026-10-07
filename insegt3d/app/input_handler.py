@@ -37,6 +37,9 @@ class PointerEvent:
 
     delta_y: float = 0.0
 
+    # Second press of a double click
+    double: bool = False
+
     @property
     def down(self):
         return self.event_type == "down"
@@ -102,4 +105,6 @@ class PointerEvent:
             rotation_rad=float(d.get("rotation_rad", 0.0)),
 
             delta_y=float(d.get("deltaY", 0.0)),
+
+            double=bool(d.get("double", False)),
         )

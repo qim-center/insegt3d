@@ -114,12 +114,14 @@ data, axis order, and converting volumes larger than RAM.
 | Input | Action |
 | --- | --- |
 | Ctrl + Left Click + Drag | Pan |
+| Ctrl + Double Click | Center the view on the clicked point |
 | Ctrl + Right Click + Drag | Scroll through slices |
 | Q / A | Step one slice up / down along the view normal |
 | Ctrl + Middle Click + Drag | Rotate the slicing plane |
 | Ctrl + Mouse Wheel | Zoom in and out |
 | Space | Randomize the orientation of the slicing plane |
 | Z / Y / X | View along the z, y or x axis, keeping the position and zoom |
+| H | Toggle the crosshair |
 | , / . | Go to the previous / next annotated slice |
 
 Touch input is supported as well: one finger pans, two fingers rotate and pinch-zoom.
@@ -159,7 +161,9 @@ The tool buttons at the top of the **Annotation** panel switch between five ways
 
 The **Display** panel toggles three overlays and sets their opacity: the **Annotation overlay**,
 the **Prediction overlay** (the result of **Predict**, once the current volume has one) and the
-**Live prediction overlay**. Drag the range under the histogram to set the intensity window. It
+**Live prediction overlay**. The **Crosshair** marks the center of the view, which rotating,
+zooming and **Z** / **Y** / **X** keep in place, so Ctrl + double-click an object to center it and
+then view it along each axis. Drag the range under the histogram to set the intensity window. It
 starts at the 0.5th to 99.5th percentile of the volume.
 
 ## Training
@@ -189,7 +193,7 @@ insegt3d predict \
 ```
 
 `--data` accepts a single Zarr store, a folder of Zarr stores, or an `http(s)` URL.
-Results are written to `<output>/predictions/<volume_name>__<id>`, where `<id>` is a short hash of the volume's location.
+Results are written to `<output>/predictions/<volume_name>__<id>.zarr`, where `<id>` is a short hash of the volume's location.
 Each result is a zarr of per-class scores (`uint8`, 0-255) with the predicted class labels in a nested `labels` zarr.
 Prediction runs at the resolution the model was trained on. Volumes without that level are skipped and listed in
 `<output>/predictions/skipped_volumes.txt`.

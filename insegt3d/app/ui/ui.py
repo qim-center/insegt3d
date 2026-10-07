@@ -26,8 +26,10 @@ SHORTCUTS = [
     ('1–9, 0', 'Select class 1–10'),
     ('C', 'Next class'),
     ('D', 'Toggle the live prediction overlay'),
+    ('H', 'Toggle the crosshair'),
     ('Ctrl + Z / Ctrl + Y', 'Undo / redo'),
     ('Ctrl + left drag', 'Pan'),
+    ('Ctrl + double-click', 'Center the view on the clicked point'),
     ('Ctrl + right drag', 'Scroll through slices'),
     ('Ctrl + middle drag', 'Rotate the slicing plane'),
     ('Ctrl + mouse wheel', 'Zoom'),
@@ -37,6 +39,14 @@ SHORTCUTS = [
     ('Space', 'Randomize the orientation'),
     ('Enter / Esc', 'Leave a text field'),
 ]
+
+# White with a dark edge, so it shows on both light and dark data
+CROSSHAIR = (
+    '<svg width="50" height="50" style="display: block">'
+    '<path d="M25 0V50M0 25H50" stroke="black" stroke-width="3" stroke-opacity="0.4" />'
+    '<path d="M25 0V50M0 25H50" stroke="white" stroke-width="1" stroke-opacity="0.8" />'
+    '</svg>'
+)
 
 class UIBuilder:
 
@@ -197,6 +207,12 @@ class UIBuilder:
         with ui.card().classes('w-full flex-1 min-h-0 p-3'):
 
             self.viewport = ui.interactive_image(sanitize=False).classes('w-full h-full')
+            with self.viewport:
+                self.crosshair = (
+                    ui.html(CROSSHAIR, sanitize=False)
+                    .classes('absolute pointer-events-none')
+                    .style('left: 50%; top: 50%; transform: translate(-50%, -50%)')
+                )
             self.overlay = self.viewport.add_layer()
             self.viewport.on('viewport_resize', self.callbacks.on_viewport_resize)
 
@@ -336,6 +352,9 @@ class UIBuilder:
 
             for element in (self.checkbox_prediction_overlay, self.slider_prediction_opacity):
                 element.bind_enabled_from(self.state.train, 'predicting', backward=lambda predicting: not predicting)
+
+            self.checkbox_crosshair = ui.checkbox('Crosshair', value=False).classes('text-base font-normal').tooltip('Toggle with H')
+            self.crosshair.bind_visibility_from(self.checkbox_crosshair, 'value')
 
             ui.separator().classes('my-2')
 

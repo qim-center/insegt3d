@@ -20,6 +20,7 @@ class Camera:
     w: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0, 1.0], dtype=np.float32))
 
     zoom: float = 1.0  # World units per slice pixel, so larger values zoom out
+    max_zoom: float = 1024.0  # Set by reset from the volume's size
     version: int = 0  # Bumped on every change so stale renders can be discarded
 
     _VECTOR_FIELDS = ("origin", "u", "v", "w")
@@ -46,6 +47,9 @@ class Camera:
         return cam
 
     def reset(self, world_shape):
+        # Zooming out stops once the whole volume is about 64 pixels across, which also keeps the
+        # slicer's tiles a bounded size at the coarsest level instead of covering the volume many times over
+        self.max_zoom = max(1.0, float(np.max(world_shape)) / 64)
         self.set_view(world_shape / 2, 1.0, AXIS_VIEWS["z"])
 
     def set_view(self, origin, zoom, uvw):
@@ -124,6 +128,6 @@ class Camera:
         rot_axis = self._normalize({"u": self.u, "v": self.v, "w": self.w}[axis])
         self._apply_rotation(Rotation.from_rotvec(rot_axis * float(angle)))
 
-    def zoom_by(self, zoom_factor, min_zoom=1 / 64, max_zoom=1024):
-        self.zoom = float(np.clip(self.zoom * zoom_factor, min_zoom, max_zoom))
+    def zoom_by(self, zoom_factor, min_zoom=1 / 64):
+        self.zoom = float(np.clip(self.zoom * zoom_factor, min_zoom, self.max_zoom))
         self.version += 1

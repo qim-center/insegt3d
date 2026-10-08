@@ -12,6 +12,7 @@ class NavigatorTool(BaseTool):
         self.rotating = False
         self.scrolling = False
         self.zooming = False
+        self.wheel_zooming = False
         self.navigating = False
 
         self._next_properties = 0.0
@@ -58,11 +59,17 @@ class NavigatorTool(BaseTool):
                 direction = -1 if e.delta_y < 0 else 1
                 zoom = 1.1 ** direction
                 camera.zoom_by(zoom)
-                self._request_hires()
+                if self.services.slicer.remote:
+                    # Remote volumes are refined once the wheel stops, so the zoom steps in between load nothing at full resolution
+                    self.wheel_zooming = True
+                    self._request_preview()
+                else:
+                    self._request_hires()
 
             if e.up:
                 self.panning = self.rotating = self.scrolling = False
-                self._request_hires()
+                # The last preview already shows this view, and a second one would only compete with the full-resolution pass
+                self.scheduler.request("nav_hires")
 
         elif e.touch:
             if e.down:
@@ -85,7 +92,7 @@ class NavigatorTool(BaseTool):
 
             if e.up:
                 self.panning = self.rotating = self.scrolling = self.zooming = False
-                self._request_hires()
+                self.scheduler.request("nav_hires")
 
         self.navigating = self.panning or self.rotating or self.scrolling or self.zooming
         self._last_x, self._last_y = e.x, e.y
@@ -132,16 +139,18 @@ class NavigatorTool(BaseTool):
         if self.services.slicer.images is None:
             return
 
-        # Idle callback: the pointer is held still mid-navigation, so refine the frame
+        # Idle callback: the pointer is held still mid-navigation, or the wheel has stopped, so refine the frame
         if settled:
-            if self.navigating:
+            if self.navigating or self.wheel_zooming:
+                self.wheel_zooming = False
                 self.scheduler.request("nav_hires")
             return
 
         camera = self.state.camera.copy()
         # Previews are one level coarser (two when oblique) and show what arrives within 50 ms
         coarsen = 1 + int(np.max(np.abs(camera.u)) < 0.98)
-        image, tiles = self._stream_image(camera, deadline=time.time() + 0.05, coarsen=coarsen)
+        # Previews only start remote reads while the request budget is mostly free, so a full-resolution pass never waits behind them
+        image, tiles = self._stream_image(camera, deadline=time.time() + 0.05, coarsen=coarsen, budget_share=0.25)
         for _ in tiles:
             pass
 
@@ -159,19 +168,20 @@ class NavigatorTool(BaseTool):
 
         self.scheduler.request("nav_overlays")
         self.scheduler.request("live_predict")
+        self.callbacks.update_properties()
 
         image, tiles = self._stream_image(camera)
         next_render = time.time() + 0.1
 
-        for _ in tiles:
+        # The first frame waits until the data already loaded is drawn, so it never shows less than the preview did
+        for cached_drawn in tiles:
             if camera.version != self.state.camera.version:
                 return
-            if time.time() >= next_render:
+            if time.time() >= next_render and cached_drawn:
                 next_render = time.time() + 0.08
                 self.renderer.update(image=image, version=camera.version, quality=1)
 
         self.renderer.update(image=image, version=camera.version, quality=1)
-        self.callbacks.update_properties()
 
     def _do_overlays(self):
         slicer = self.services.slicer
@@ -195,22 +205,31 @@ class NavigatorTool(BaseTool):
         camera.step(steps * np.linalg.norm(slicer.voxel_sizes[0] * camera.u))
         self._request_hires()
 
-    def _stream_image(self, camera, deadline=None, coarsen=0):
+    def _stream_image(self, camera, deadline=None, coarsen=0, budget_share=1.0):
         slicer = self.services.slicer
 
         # 0 when axis-aligned, 1 along a cube diagonal
         obliqueness = np.arccos(np.clip(np.max(np.abs(camera.u)), -1.0, 1.0)) / np.arccos(1 / np.sqrt(3))
 
-        keep_level = slicer.level(camera.zoom, 3 if obliqueness > 0.3 else 2)
-        target = slicer.level(camera.zoom, coarsen)
+        keep_level = slicer.level(camera, level_modifier=3 if obliqueness > 0.3 else 2)
+        target = slicer.level(camera, level_modifier=coarsen)
+        coarsest = max(slicer.fallback[0] - 1, target)
+        tile_hw = int(np.clip(256 / (1 + 4 * obliqueness), 96, 256))
+        levels = range(coarsest, target - 1, -1)
+        if slicer.remote:
+            # Every level costs requests, so remote views draw the finest level already cached in view and request finer
+            # levels at most five above the target, the coarsest spanning the view in a few chunks that arrive first.
+            # Small tiles are drawn as soon as their chunks arrive
+            cached = slicer.cached_level(camera, levels, self.state.nav.extent)
+            levels = [level for level in levels if level == cached or (level <= target + 5 and (cached is None or level < cached))]
+            tile_hw = 64
+
         # Coarse to fine: the in-memory fallback, then each level down to the target
         fallback = [slicer.fallback] if target < slicer.fallback[0] else []
-        sources = fallback + slicer.sources(range(max(slicer.fallback[0] - 1, target), target - 1, -1))
-
-        tile_hw = int(np.clip(256 / (1 + 4 * obliqueness), 96, 256))
+        sources = fallback + slicer.sources(levels)
 
         h, w = self.state.nav.slice_shape
         image = np.zeros((max(1, h >> coarsen), max(1, w >> coarsen)), dtype=np.float32)
-        tiles = slicer.stream(camera, image[None], sources, self.state.nav.extent, keep_level=keep_level, deadline=deadline, order=1, tile_hw=tile_hw)
+        tiles = slicer.stream(camera, image[None], sources, self.state.nav.extent, keep_level=keep_level, deadline=deadline, order=1, tile_hw=tile_hw, budget_share=budget_share)
 
         return image, tiles

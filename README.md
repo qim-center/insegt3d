@@ -164,7 +164,8 @@ the **Prediction overlay** (the result of **Predict**, once the current volume h
 **Live prediction overlay**. The **Crosshair** marks the center of the view, which rotating,
 zooming and **Z** / **Y** / **X** keep in place, so Ctrl + double-click an object to center it and
 then view it along each axis. Drag the range under the histogram to set the intensity window. It
-starts at the 0.5th to 99.5th percentile of the volume.
+starts at the 0.5th to 99.5th percentile of the whole volume at low resolution and its center at full
+resolution.
 
 ## Training
 

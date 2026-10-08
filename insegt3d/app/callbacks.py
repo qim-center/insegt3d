@@ -427,7 +427,7 @@ class CallbackManager:
         self.ui.label_rotation_u.text = f'u  {fmt(u)}'
         self.ui.label_rotation_v.text = f'v  {fmt(v)}'
         self.ui.label_rotation_w.text = f'w  {fmt(w)}'
-        self.ui.label_zoom.text = f'{zoom:.02f}'
+        self.ui.label_zoom.text = f'{zoom:.3g}'
         self.ui.label_shape.text = f'z: {volume_shape[0]}, y: {volume_shape[1]}, x: {volume_shape[2]}'
 
     def predict_volumes(self):

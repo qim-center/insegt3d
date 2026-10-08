@@ -8,6 +8,7 @@ import numpy as np
 import tifffile as tiff
 from pathlib import Path
 from urllib.parse import urlparse
+from concurrent.futures import ThreadPoolExecutor
 
 # Axis order required by OME-Zarr 0.5: time, channel, then the spatial axes
 OME_AXES = ('t', 'c', 'z', 'y', 'x')
@@ -16,6 +17,8 @@ MAX_NDIM = len(OME_AXES)
 _AXIS_TYPES = {'t': 'time', 'c': 'channel'}
 
 MASK_DTYPE = 'uint8'
+
+HTTP_REQUEST_CONCURRENCY = 32
 
 def default_axes(ndim):
     if not 3 <= ndim <= MAX_NDIM:
@@ -45,7 +48,7 @@ def normalize_zarr_path(zarr_path):
 def make_ts_context(cache_size_mb=4096):
     return ts.Context({
         'cache_pool': {'total_bytes_limit': int(cache_size_mb * 1024**2)},
-        'http_request_concurrency': {'limit': 32}
+        'http_request_concurrency': {'limit': HTTP_REQUEST_CONCURRENCY}
     })
 
 def is_http_url(zarr_path):
@@ -180,9 +183,15 @@ def read_multiscale_zarr(zarr_path, ts_context=None, cache_size_mb=4096, recheck
     axes = tuple(str(axis['name']).lower() for axis in multiscale['axes'])
     spatial = list(transpose_order(axes, len(axes))[-3:])
 
-    images, scales, translations = [], [], []
+    def open_level(dataset):
+        return read_zarr_as_tensorstore(f"{zarr_path}/{dataset['path']}", axes=axes, ts_context=ts_context, cache_size_mb=cache_size_mb, recheck=recheck)
+
+    # Levels are opened at once, since each open is a round trip for a remote volume
+    with ThreadPoolExecutor(len(multiscale['datasets'])) as pool:
+        images = list(pool.map(open_level, multiscale['datasets']))
+
+    scales, translations = [], []
     for dataset in multiscale['datasets']:
-        images.append(read_zarr_as_tensorstore(f"{zarr_path}/{dataset['path']}", axes=axes, ts_context=ts_context, cache_size_mb=cache_size_mb, recheck=recheck))
         scale, translation = _scale_translation(dataset['coordinateTransformations'] + multiscale.get('coordinateTransformations', []), len(axes))
         scales.append(scale[spatial])
         translations.append(translation[spatial])

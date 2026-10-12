@@ -1,9 +1,11 @@
+import os
 import sys
 import ctypes
 import socket
 import argparse
 from nicegui import ui, app
 from insegt3d.app.app import InteractiveSegmentationApp
+from insegt3d.auth import TokenAuth
 
 class StripRootPath:
     """ASGI middleware to strip the base path from requests forwarded by a reverse proxy such as Nginx."""
@@ -80,10 +82,25 @@ def main():
         default=16,
         help='Memory for cached volume data, in GiB (default: 16)'
     )
+    parser.add_argument(
+        '--token',
+        type=str,
+        default=os.environ.get('INSEGT3D_TOKEN'),
+        help=(
+            'Require this token to access the application, given as a "token" URL parameter, an '
+            '"Authorization: token ..." header or on a login page. Can also be set with the '
+            'INSEGT3D_TOKEN environment variable, which keeps it out of the process list. '
+            'Default is no token'
+        )
+    )
     args = parser.parse_args()
 
     port = args.port or _free_port()
     root_path = _normalize_base_path(args.server_base_path)
+
+    # Added before StripRootPath, which then runs first and gives TokenAuth the stripped path
+    if args.token:
+        app.add_middleware(TokenAuth, token=args.token, cookie_name=f'insegt3d-token-{port}')
 
     if root_path:
         app.add_middleware(StripRootPath, root_path=root_path)

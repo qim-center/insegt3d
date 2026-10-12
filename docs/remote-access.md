@@ -42,7 +42,25 @@ On most clusters you SSH into a login node, while InSegt3D runs on a compute nod
 
 4. Open `http://localhost:{local_port}` in your browser.
 
-InSegt3D has no login, so with `--host 0.0.0.0` anyone who can reach the compute node on the cluster network can open it. Stop InSegt3D when you are done.
+With `--host 0.0.0.0` anyone who can reach the compute node on the cluster network can open InSegt3D, so protect it with a token as described below. Stop InSegt3D when you are done.
+
+## Access token
+
+By default InSegt3D asks for no login. Start it with `--token` to require a token, as Jupyter does:
+
+```bash
+insegt3d --project_folder "path/to/project_folder" --token "choose-a-long-random-string"
+```
+
+Command-line arguments are visible to other users on the machine, so on a shared system set the `INSEGT3D_TOKEN` environment variable instead.
+
+A client then provides the token in one of three ways:
+
+- In the address, as in `http://localhost:8080/?token=choose-a-long-random-string`. The browser stores the token in a cookie and removes it from the address.
+- In an `Authorization: token choose-a-long-random-string` header (`Authorization: Bearer ...` works too).
+- On the login page InSegt3D shows when neither is given. The token is stored in a cookie, so you only enter it once per browser.
+
+The token travels unencrypted unless the connection is encrypted, as it is through an SSH tunnel.
 
 ## Tips
 

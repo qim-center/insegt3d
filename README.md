@@ -74,6 +74,7 @@ In the interface:
 | `--port` | random | Port to serve the interface on |
 | `--host` | `localhost` | Address to serve on. Use `0.0.0.0` to allow access from other machines |
 | `--server_base_path` | none | URL prefix to serve under, e.g. behind a reverse proxy |
+| `--token` | none | Require this token to open the interface, see [Remote access](docs/remote-access.md#access-token). Can also be set with the `INSEGT3D_TOKEN` environment variable |
 | `--cache_gb` | `16` | Memory for cached volume data, in GiB. The app uses about 5 GiB on top of this, so lower it if the system starts swapping |
 
 Use `insegt3d --help` for the full list of options.

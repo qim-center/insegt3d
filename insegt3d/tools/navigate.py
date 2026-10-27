@@ -155,6 +155,7 @@ class NavigatorTool(BaseTool):
             pass
 
         self.renderer.update(image=image, version=camera.version, fit=False)
+        self.scheduler.request('region_overlay', camera)
 
         if time.time() >= self._next_properties:
             self._next_properties = time.time() + 0.1
@@ -168,6 +169,7 @@ class NavigatorTool(BaseTool):
 
         self.scheduler.request("nav_overlays")
         self.scheduler.request("live_predict")
+        self.scheduler.request('region_overlay', camera)
         self.callbacks.update_properties()
 
         image, tiles = self._stream_image(camera)
@@ -190,7 +192,8 @@ class NavigatorTool(BaseTool):
 
         self.renderer.clear("annotation", "saved_prediction")
 
-        mask = slicer.get_data(camera, extent=nav.extent, out_shape=nav.slice_shape, mask=True)
+        # Mask levels finer than the working level can lack recent strokes
+        mask = slicer.get_data(camera, extent=nav.extent, out_shape=nav.slice_shape, mask=True, min_level=self.state.train.level)
         saved_prediction = None
         if slicer.has_prediction:
             saved_prediction = slicer.get_data(camera, extent=nav.extent, out_shape=nav.slice_shape, prediction=True)

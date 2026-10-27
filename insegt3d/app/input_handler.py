@@ -4,14 +4,19 @@ class InputHandler:
 
     def __init__(self, tools):
         self.tools = tools
+        self.enabled = True
 
     async def on_pointer(self, e):
+        if not self.enabled:
+            return
         e = PointerEvent.from_dict(e.args['detail'])
 
         for t in self.tools:
             await t.on_pointer(e)
 
     async def on_key(self, e):
+        if not self.enabled:
+            return
         for t in self.tools:
             await t.on_key(e)
 

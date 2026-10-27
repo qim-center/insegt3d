@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "insegt3d"
-version = "0.2.1"
+version = "0.3.0"
 description = "An interactive segmentation tool for 3D volumetric data."
 license = { text = "BSD-2-Clause" }
 requires-python = "==3.13.*"
@@ -27,3 +27,6 @@ insegt3d = "insegt3d.main:main"
 
 [tool.setuptools.packages.find]
 include = ["insegt3d*"]
+
+[tool.setuptools.package-data]
+"insegt3d.app.ui" = ["*.css"]

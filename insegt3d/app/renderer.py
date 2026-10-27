@@ -25,6 +25,7 @@ class ViewportRenderer:
         self.raw_image = None
 
         self._lock = threading.Lock()
+        self._svg = {'regions': '', 'annotation': ''}
         # (camera version, quality) of the shown image, so incoming images that compare lower are dropped
         self._stamp = (0, 0)
         # Camera version each overlay was computed for, so overlays from other versions are hidden
@@ -39,9 +40,12 @@ class ViewportRenderer:
         if "prediction" in names:
             self.raw_prediction = None
 
-    def update_svg(self, content):
+    def update_svg(self, content, part='annotation'):
+        if self._svg[part] == content:
+            return
+        self._svg[part] = content
         if self.overlay is not None:
-            self.overlay.content = content
+            self.overlay.content = ''.join(self._svg.values())
 
     def prediction_in_viewport(self, version):
         """Live prediction at viewport size, or None if it is hidden or not from camera `version`."""

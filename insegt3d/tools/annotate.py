@@ -42,7 +42,7 @@ class AnnotatorTool(BaseTool):
             self.annot.brush_size *= factor
             self.callbacks.set_brush_size()
 
-        if not e.ctrl and self.annot.mode in BRUSH_MODES and (e.primary or e.eraser) and e.down:
+        if not e.ctrl and self.annot.mode in BRUSH_MODES and (e.primary or e.eraser) and e.down and not self.train.changing_level:
             self.annot.annotating = True
             self._erasing = e.eraser or self.annot.mode == 'erase'
 
@@ -119,12 +119,14 @@ class AnnotatorTool(BaseTool):
         self.strokes[-1][2].append((x, y))
 
     def _end_path(self, keeping):
-        mask = self._create_mask(self.strokes, keeping=keeping)
-        self.scheduler.request("write_mask", mask, self.camera.copy())
+        segments = self._slice_segments()
+        mask = self._create_mask(segments, keeping=keeping)
+        # Finer levels redraw the brush path, but Keep strokes take their pixels from the prediction
+        self.scheduler.request("write_mask", mask, self.camera.copy(), None if keeping else segments)
         self.strokes.clear()
 
     def _get_overlay(self):
-        if self._overlay_hidden:
+        if self._overlay_hidden or self.annot.mode == 'regions':
             return ''
 
         a = self.annot
@@ -142,7 +144,7 @@ class AnnotatorTool(BaseTool):
         )
         return f'<g opacity="{opacity}">{stroke}</g>{cursor}'
 
-    def _do_write_mask(self, mask, camera=None):
+    def _do_write_mask(self, mask, camera=None, path=None):
 
         if mask is None or self.train.changing_classes:
             return
@@ -150,7 +152,7 @@ class AnnotatorTool(BaseTool):
         if camera is None:
             camera = self.camera.copy()
 
-        self.history.commit(camera, mask, self.nav.extent)
+        self.history.commit(camera, mask, self.nav.extent, path)
 
         self.scheduler.request("nav_overlays")
         self.scheduler.request("live_train")
@@ -163,17 +165,25 @@ class AnnotatorTool(BaseTool):
         self.history.redo()
         self.scheduler.request("nav_overlays")
 
-    def _create_mask(self, strokes, keeping=False):
+    def _slice_segments(self):
+        """The stroke as (width, label, points) segments in slice pixels."""
         slice_h, slice_w = self.nav.slice_shape
         view_h, view_w = self.ui.viewport_shape
 
         scale = np.array([slice_w / view_w, slice_h / view_h])
 
+        return [
+            (max(1, int(np.rint(brush_size * scale[1]))), label, (np.array(points) * scale).astype(np.int32))
+            for brush_size, label, points in self.strokes
+        ]
+
+    def _create_mask(self, segments, keeping=False):
+        slice_h, slice_w = self.nav.slice_shape
+
         mask = np.zeros((slice_h, slice_w), np.uint8)
 
-        for brush_size, label, points in strokes:
-            points = (np.array(points) * scale).astype(np.int32)
-            cv2.polylines(mask, [points], False, label, max(1, int(np.rint(brush_size * scale[1]))))
+        for width, label, points in segments:
+            cv2.polylines(mask, [points], False, label, width)
 
         # Keep mode paints the live prediction under the stroke instead of the class
         if keeping:

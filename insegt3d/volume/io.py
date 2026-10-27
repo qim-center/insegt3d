@@ -2,6 +2,7 @@ import math
 import zarr
 import base64
 import hashlib
+import itertools
 import tensorstore as ts
 
 import numpy as np
@@ -54,6 +55,11 @@ def make_ts_context(cache_size_mb=4096):
 def is_http_url(zarr_path):
     return urlparse(normalize_zarr_path(zarr_path)).scheme in ("http", "https")
 
+def require_https(zarr_path):
+    """Refuses plain http URLs, whose responses could be altered to exploit tensorstore's Brotli decoder (CVE-2026-111497)."""
+    if urlparse(normalize_zarr_path(zarr_path)).scheme == "http":
+        raise ValueError(f"Remote volumes must use https://, not http://: {zarr_path}")
+
 def url_id(url, length=10):
     digest = hashlib.sha256(url.encode("utf-8")).digest()
     token = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
@@ -71,22 +77,24 @@ def volume_folder_name(zarr_ref):
     return f"{path.stem}__{url_id(str(path))}.zarr"
 
 def resolve_zarr_inputs(data_path):
-    """Zarr volumes in data_path: a single store, every store in a folder, or comma-separated http(s) URLs."""
+    """Zarr volumes in data_path: a single store, every store in a folder, or comma-separated https URLs."""
     data_path = str(data_path).strip()
     if not data_path:
         raise ValueError("Enter a path or URL to load.")
 
     parts = [p.strip() for p in data_path.split(",") if p.strip()]
     if parts and all(is_http_url(p) for p in parts):
+        for part in parts:
+            require_https(part)
         return parts
     if len(parts) > 1:
-        raise ValueError("All comma-separated paths must be http(s) URLs.")
+        raise ValueError("All comma-separated paths must be https URLs.")
 
     path = Path(data_path).expanduser().resolve()
     if not path.exists():
         raise FileNotFoundError(f"Data path not found: {data_path}")
     if not path.is_dir():
-        raise ValueError(f"Data path must be a zarr directory, a folder of zarrs, or an http(s) URL: {data_path}")
+        raise ValueError(f"Data path must be a zarr directory, a folder of zarrs, or an https URL: {data_path}")
 
     if is_multiscale_zarr(path):
         return [str(path)]
@@ -131,14 +139,17 @@ def _create_array(root, name, shape, dtype, chunks, shards=None):
         dimension_names=default_axes(len(shape)),
         overwrite=True)
 
-def create_empty_zarr(zarr_path, level_shapes, scales, translations, chunks=(64,64,64), shards=(256,256,256), dtype=MASK_DTYPE):
+def create_mask_levels(mask_path, levels, level_shapes, scales, translations, chunks=(64,64,64), shards=(256,256,256)):
+    """Create missing mask arrays at image levels and update their metadata."""
+    Path(mask_path).parent.mkdir(parents=True, exist_ok=True)
+    root = zarr.open_group(str(mask_path), mode='a')
 
-    root = zarr.open(zarr_path, mode='w')
+    for level in levels:
+        if str(level) not in root:
+            _create_array(root, str(level), level_shapes[level], MASK_DTYPE, chunks, shards)
 
-    for i, shape in enumerate(level_shapes):
-        _create_array(root, str(i), shape, dtype, chunks, shards)
-
-    write_multiscale_metadata(root, scales, translations, name=Path(zarr_path).stem)
+    stored = sorted(int(name) for name in root.array_keys())
+    write_multiscale_metadata(root, scales[stored], translations[stored], name=Path(mask_path).stem, paths=stored)
 
 def read_zarr_as_tensorstore(zarr_path, axes=None, ts_context=None, cache_size_mb=4096, recheck=False):
 
@@ -178,6 +189,7 @@ def read_zarr_as_tensorstore(zarr_path, axes=None, ts_context=None, cache_size_m
 def read_multiscale_zarr(zarr_path, ts_context=None, cache_size_mb=4096, recheck=False):
 
     zarr_path = normalize_zarr_path(zarr_path)
+    require_https(zarr_path)
 
     multiscale = get_multiscale(zarr_path)
     axes = tuple(str(axis['name']).lower() for axis in multiscale['axes'])
@@ -207,24 +219,12 @@ def _scale_translation(transformations, ndim):
             translation = translation + transformation['translation']
     return scale, translation
 
-def read_multiscale_masks(mask_path, level_shapes, scales, translations, ts_context=None):
-
-    mask_path = Path(mask_path)
-
-    mask_path.parent.mkdir(parents=True, exist_ok=True)
-
-    if not mask_path.exists():
-        create_empty_zarr(
-            zarr_path=str(mask_path),
-            level_shapes=level_shapes,
-            scales=scales,
-            translations=translations,
-            dtype=MASK_DTYPE)
-
-    return [
-        read_zarr_as_tensorstore(str(mask_path / str(level)), ts_context=ts_context, recheck="open")
-        for level in range(len(level_shapes))
-    ]
+def read_multiscale_masks(mask_path, num_levels, ts_context=None):
+    """Return mask arrays by image level, or None where a level is absent."""
+    masks = [None] * num_levels
+    for path in get_scale_paths(mask_path):
+        masks[int(path)] = read_zarr_as_tensorstore(f'{mask_path}/{path}', ts_context=ts_context, recheck="open")
+    return masks
 
 def remap_labels(root, lut):
     # Every level of every mask under root, rewriting only the shards that exist on disk
@@ -267,7 +267,7 @@ def write_batches(dst_vol, volume, mem_limit_gb, dtype=None):
         block = np.ascontiguousarray(volume[start:end])
         dst_vol[start:end] = block if dtype is None else block.astype(dtype, copy=False)
 
-def add_multiscales(src_file, scale=(1.0, 1.0, 1.0), translation=(0.0, 0.0, 0.0)):
+def add_multiscales(src_file, scale=(1.0, 1.0, 1.0), translation=(0.0, 0.0, 0.0), boxes=None):
 
     root = zarr.open(src_file, mode='r+')
 
@@ -281,14 +281,20 @@ def add_multiscales(src_file, scale=(1.0, 1.0, 1.0), translation=(0.0, 0.0, 0.0)
     for i in range(num_steps):
         src = root[str(i)]
         dst_shape = src.shape[:-3] + tuple(s // 2 for s in src.shape[-3:])
-        dst = _create_array(root, str(i + 1), dst_shape, src.dtype, spatial_chunks, spatial_shards)
-        downsample_volume(src, dst, block_size=(spatial_shards or spatial_chunks)[0])
+        if boxes is None or str(i + 1) not in root:
+            dst = _create_array(root, str(i + 1), dst_shape, src.dtype, spatial_chunks, spatial_shards)
+        else:
+            dst = root[str(i + 1)]
+        factor = 2 ** (i + 1)
+        for box in [None] if boxes is None else [(lo // factor, -(-hi // factor)) for lo, hi in boxes]:
+            downsample_volume(src, dst, block_size=(spatial_shards or spatial_chunks)[0], box=box)
 
     write_multiscale_metadata(
         root, [np.multiply(scale, 2 ** i) for i in range(num_steps + 1)], [translation] * (num_steps + 1), name=Path(src_file).stem)
 
-def write_multiscale_metadata(root, scales, translations=None, *, name):
-    axes = default_axes(root['0'].ndim)
+def write_multiscale_metadata(root, scales, translations=None, *, name, paths=None):
+    paths = range(len(scales)) if paths is None else paths
+    axes = default_axes(root[str(paths[0])].ndim)
     extra_dims = len(axes) - 3
     translations = np.zeros_like(scales, dtype=float) if translations is None else translations
 
@@ -296,14 +302,14 @@ def write_multiscale_metadata(root, scales, translations=None, *, name):
         'axes': [{'name': axis, 'type': _AXIS_TYPES.get(axis, 'space')} for axis in axes],
         'datasets': [
             {
-                'path': str(i),
+                'path': str(path),
                 'coordinateTransformations': [
                     # Leading channel/time axes are never downsampled
                     {'type': 'scale', 'scale': [1.0] * extra_dims + [float(s) for s in scale]},
                     {'type': 'translation', 'translation': [0.0] * extra_dims + [float(t) for t in translation]},
                 ],
             }
-            for i, (scale, translation) in enumerate(zip(scales, translations))
+            for path, scale, translation in zip(paths, scales, translations)
         ],
         'name': str(name),
     }
@@ -313,14 +319,15 @@ def write_multiscale_metadata(root, scales, translations=None, *, name):
         'multiscales': [multiscale],
     }
 
-def downsample_volume(src_vol, dst_vol, block_size=512):
-    """Halves each spatial axis by keeping every second voxel, one block at a time."""
+def downsample_volume(src_vol, dst_vol, block_size=512, box=None):
+    """Halves each spatial axis, optionally within `box` in destination voxels."""
     leading = (slice(None),) * (src_vol.ndim - 3)
     shape = dst_vol.shape[-3:]
+    lo, hi = ((0, 0, 0), shape) if box is None else (np.maximum(box[0], 0), np.minimum(box[1], shape))
     step = max(1, block_size // 2)
 
-    for index in np.ndindex(*(math.ceil(n / step) for n in shape)):
-        dst = tuple(slice(i * step, min((i + 1) * step, n)) for i, n in zip(index, shape))
+    for index in itertools.product(*(range(int(a) // step, math.ceil(b / step)) for a, b in zip(lo, hi))):
+        dst = tuple(slice(max(i * step, int(a)), min((i + 1) * step, int(b))) for i, a, b in zip(index, lo, hi))
         src = tuple(slice(2 * s.start, 2 * s.stop, 2) for s in dst)
         dst_vol[leading + dst] = src_vol[leading + src]
 
@@ -391,7 +398,7 @@ def convert_tiff_stack(
 
     finish_zarr(root, dst_file, multiscale, voxel_size)
 
-def write_tiff_stack(volume, dst_folder, mem_limit_gb=1):
+def write_tiff_stack(volume, dst_folder, mem_limit_gb=1, box=None):
 
     if not 3 <= volume.ndim <= 4:
         raise ValueError(f"Expected a 3D or 4D volume, got {volume.ndim}D")
@@ -399,10 +406,13 @@ def write_tiff_stack(volume, dst_folder, mem_limit_gb=1):
     dst_folder = Path(dst_folder)
     dst_folder.mkdir(parents=True, exist_ok=True)
 
-    num_slices = volume.shape[-3]
+    lo, hi = ((0, 0, 0), volume.shape[-3:]) if box is None else box
+    leading = (slice(None),) * (volume.ndim - 3)
+    rows, columns = slice(int(lo[1]), int(hi[1])), slice(int(lo[2]), int(hi[2]))
+    num_slices = int(hi[0] - lo[0])
     digits = len(str(max(num_slices - 1, 1)))
 
-    slice_nbytes = int(np.prod(volume.shape[-2:])) * (volume.shape[0] if volume.ndim == 4 else 1) * volume.dtype.itemsize
+    slice_nbytes = int((hi[1] - lo[1]) * (hi[2] - lo[2])) * (volume.shape[0] if volume.ndim == 4 else 1) * volume.dtype.itemsize
     slices_per_read = items_per_batch(slice_nbytes, mem_limit_gb)
 
     chunks = getattr(volume, 'chunks', None)
@@ -412,7 +422,7 @@ def write_tiff_stack(volume, dst_folder, mem_limit_gb=1):
     for start in range(0, num_slices, slices_per_read):
         end = min(start + slices_per_read, num_slices)
 
-        block = volume[(slice(None),) * (volume.ndim - 3) + (slice(start, end),)]
+        block = volume[leading + (slice(int(lo[0]) + start, int(lo[0]) + end), rows, columns)]
 
         if volume.ndim == 4:
             block = np.moveaxis(block, 0, -1)

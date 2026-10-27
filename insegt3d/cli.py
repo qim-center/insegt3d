@@ -19,7 +19,7 @@ def build_predict_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         '--data', type=str, required=True,
-        help='A single zarr volume, a folder containing multiple zarr volumes, or an http(s) zarr URL.'
+        help='A single zarr volume, a folder containing multiple zarr volumes, or an https zarr URL.'
     )
     parser.add_argument(
         '--output', type=str, required=True,

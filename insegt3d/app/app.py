@@ -13,13 +13,14 @@ from insegt3d.tools.navigate import NavigatorTool
 from insegt3d.tools.annotate import AnnotatorTool
 from insegt3d.tools.flood_fill import FloodFillTool
 from insegt3d.tools.mask_fill import MaskFillTool
+from insegt3d.tools.regions import RegionTool
 from insegt3d.ml.live_trainer import LiveTrainer
 
 class InteractiveSegmentationApp:
 
-    def __init__(self, args):
+    def __init__(self, args, project_path, on_switch, on_shutdown):
 
-        self.state = AppState(data=DataState(Path(args.project_folder))) if args.project_folder else AppState()
+        self.state = AppState(data=DataState(Path(project_path)))
         self.state.data.cache_size_mb = int(args.cache_gb * 1024)
         self.services = AppServices(self.state)
 
@@ -37,9 +38,13 @@ class InteractiveSegmentationApp:
             AnnotatorTool(self.state, self.services, self.renderer, self.scheduler, self.callbacks),
             FloodFillTool(self.state, self.services, self.renderer, self.scheduler, self.callbacks),
             MaskFillTool(self.state, self.services, self.renderer, self.scheduler, self.callbacks),
+            RegionTool(self.state, self.services, self.renderer, self.scheduler, self.callbacks),
         ]
 
         self.input_handler = InputHandler(self.tools)
+        self.on_switch = on_switch
+        self.on_shutdown = on_shutdown
+        self._closed = False
 
     def open_view(self):
         if self.callbacks.client is not None:
@@ -52,6 +57,8 @@ class InteractiveSegmentationApp:
             callbacks=self.callbacks,
             input_handler=self.input_handler,
             scheduler=self.scheduler,
+            on_switch=self.on_switch,
+            on_shutdown=self.on_shutdown,
         )
         self.callbacks.ui, self.callbacks.client = view, context.client
         self.renderer.viewport, self.renderer.overlay = view.build()
@@ -64,6 +71,15 @@ class InteractiveSegmentationApp:
             self.callbacks.ui = self.callbacks.client = None
             self.renderer.viewport = self.renderer.overlay = None
 
-    def close(self):
-        self.scheduler.shutdown()
+    async def close(self):
+        if self._closed:
+            return
+        self.services.regions.save()
+        self._closed = True
+        self.input_handler.enabled = False
+        self.callbacks._closing = True
+        self.callbacks._predict_cancel_event.set()
         self.live_trainer.close()
+        async with self.callbacks._open_lock:
+            await self.scheduler.drain()
+        self.scheduler.shutdown()

@@ -11,6 +11,7 @@ from datetime import timedelta
 from nicegui import run, ui as nicegui_ui
 
 from insegt3d.ml import predict2d as predict
+from insegt3d.app.regions import region_box
 from insegt3d.volume.io import resolve_zarr_inputs, volume_folder_name
 from insegt3d.volume.camera import AXIS_VIEWS
 
@@ -61,6 +62,7 @@ class CallbackManager:
 
         self._open_lock = asyncio.Lock()
         self._predict_cancel_event = threading.Event()
+        self._closing = False
 
         self.scheduler.register_async("sync_navigator", self._sync_navigator, max_hz=15)
 
@@ -81,6 +83,8 @@ class CallbackManager:
         zarr_ref = self.data.active_zarr
 
         async with self._open_lock:
+            if self._closing:
+                return
             await run.io_bound(
                 self.slicer.initialize, zarr_ref, Path(self.data.project_path) / 'masks' / volume_folder_name(zarr_ref), self.camera,
                 center_camera=True, prediction_path=_prediction_label_path(self.data.project_path, zarr_ref),
@@ -90,31 +94,37 @@ class CallbackManager:
             if update_histogram:
                 await self._update_histogram()
 
-        self.refresh_view()
+        if not self._closing:
+            self.refresh_view()
 
     def refresh_view(self):
         if self.ui is None or self.slicer.images is None:
             return
 
         self.ui.navigator.initialize(self.slicer.world_shape)
+        self.ui.empty_view.set_visibility(False)
+        self.ui.navigator_empty.set_visibility(False)
         self._refresh_intensity_range()
         self._refresh_prediction_overlay_availability()
-        self._refresh_level_options()
+        self.refresh_level()
         self.update_properties()
+        self.state.regions.selected = None
         self._plane_idx = None
         self.ui.label_plane.text = 'Annotated slices'
 
-    def _refresh_level_options(self):
+    @on_view
+    def refresh_level(self):
         num_levels = len(self.slicer.images) if self.slicer.images is not None else 0
-
-        if not self.train.model_locked and num_levels:
-            self.train.level = min(self.train.level, num_levels - 1)
-        self.ui.select_level.set_options(self.level_options(), value=self.train.level)
+        level = self.ui.select_level.value
+        options = self.level_options()
+        options.setdefault(level, f'Level {level}')
+        self.ui.select_level.set_options(options, value=level)
 
         self.train.level_available = self.train.level < num_levels
         self.ui.button_predict.set_enabled(self.train.level_available)
         self.ui.label_live_train_status.text = '' if self.train.level_available else (
             f'Training and prediction disabled: this volume has no level {self.train.level}.')
+        self.refresh_regions()
 
     def level_options(self):
         options = {}
@@ -146,10 +156,15 @@ class CallbackManager:
         return (max(1, round(h * scale)), max(1, round(w * scale)))
 
     async def load_zarr_files(self):
+        if self._closing:
+            return
         try:
             zarr_files = await run.io_bound(resolve_zarr_inputs, self.data.input_path)
         except (FileNotFoundError, ValueError) as e:
             nicegui_ui.notify(str(e), type='warning')
+            return
+
+        if self._closing:
             return
 
         if zarr_files == self.data.zarr_files:
@@ -169,6 +184,8 @@ class CallbackManager:
         return {i: Path(str(f).rstrip("/")).stem for i, f in enumerate(self.data.zarr_files)} or {0: 'None'}
 
     async def select_scan(self):
+        if self._closing:
+            return
 
         self.data.zarr_idx = int(self.ui.select_scan.value or 0)
         if self.data.active_zarr is None:
@@ -182,7 +199,8 @@ class CallbackManager:
             self.ui.select_scan.set_options(self.scan_options(), value=0)
             raise
 
-        self._request_slice_update()
+        if not self._closing:
+            self._request_slice_update()
 
     @on_view
     def _refresh_prediction_overlay_availability(self):
@@ -253,18 +271,19 @@ class CallbackManager:
             self._histogram_counts,
             self._histogram_range,
             self.ui_state.intensity_low,
-            self.ui_state.intensity_high
+            self.ui_state.intensity_high,
+            dark=self.ui.dark_mode.value,
         )
         _, encoded = cv2.imencode('.png', cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR))
         b64 = base64.b64encode(encoded).decode('ascii')
         self.ui.image_histogram.set_source(f'data:image/png;base64,{b64}')
 
     @staticmethod
-    def _render_histogram_image(counts, value_range, low, high, width=440, height=64):
-        background = (245, 245, 245)
-        bar_color = (165, 176, 191)
-        dim_color = (223, 226, 231)
-        marker_color = (220, 38, 38)
+    def _render_histogram_image(counts, value_range, low, high, width=440, height=64, dark=False):
+        background = (45, 41, 38) if dark else (248, 249, 250)
+        bar_color = (252, 115, 35)
+        dim_color = (105, 95, 88) if dark else (205, 202, 198)
+        marker_color = (230, 63, 71)
 
         canvas = np.full((height, width, 3), background, dtype=np.uint8)
 
@@ -309,7 +328,7 @@ class CallbackManager:
         self.annot.color_idx = min(self.annot.color_idx, self.train.num_classes - 1)
 
         for i, button in enumerate(self.ui.button_palette):
-            border = 'black' if i == self.annot.color_idx else 'transparent'
+            border = ('white' if self.ui.dark_mode.value else '#242424') if i == self.annot.color_idx else 'transparent'
             button.set_visibility(i < self.train.num_classes)
             button.style(f'background:{self.annot.colors[i]} !important; border:2px solid {border};')
 
@@ -330,7 +349,7 @@ class CallbackManager:
         volumes = len({a.volume_path for a in annotations})
         self.ui.label_remove_class.text = (
             f'Remove class {i + 1}? Its {len(annotations)} annotation(s) in {volumes} volume(s) will be erased and later '
-            f'classes renumbered, keeping their colours. Existing predictions keep the old classes. This cannot be undone.'
+            f'classes renumbered, keeping their colors. Existing predictions keep the old classes. This cannot be undone.'
         )
         if await self.ui.dialog_remove_class:
             self.train.changing_classes = True
@@ -430,57 +449,173 @@ class CallbackManager:
         self.ui.label_zoom.text = f'{zoom:.3g}'
         self.ui.label_shape.text = f'z: {volume_shape[0]}, y: {volume_shape[1]}, x: {volume_shape[2]}'
 
+    def _regions(self):
+        return [] if self.slicer.images is None else self.services.regions.of(self.slicer.zarr_path)
+
+    @on_view
+    def refresh_regions(self):
+        regions = self._regions()
+        selected = self.state.regions.selected
+        if selected is not None and selected >= len(regions):
+            selected = self.state.regions.selected = None
+
+        self.ui.list_regions.clear()
+        with self.ui.list_regions:
+            if not regions:
+                nicegui_ui.label('No regions yet. Add one to focus prediction on a smaller area.').classes('region-empty')
+            for i, region in enumerate(regions):
+                with nicegui_ui.row().classes('region-row' + (' is-selected' if i == selected else '')):
+                    nicegui_ui.checkbox(value=region['predict'], on_change=lambda e, region=region: self.set_region_predict(region, e.value)).props('dense').bind_enabled_from(self.train, 'predicting', backward=lambda predicting: not predicting).tooltip('Include in prediction')
+                    with nicegui_ui.column().classes('region-summary').on('click', lambda i=i: self.select_region(i)):
+                        nicegui_ui.label(f'Region {i + 1}').classes('region-name')
+                        nicegui_ui.label(self._region_size(region['box'])).classes('region-size')
+                    nicegui_ui.button(icon='center_focus_strong', on_click=lambda i=i: self.go_to_region(i)).props('dense flat size=sm').tooltip('Go to region')
+                    nicegui_ui.button(icon='delete', on_click=lambda i=i: self.remove_region(i)).props('dense flat size=sm').bind_enabled_from(self.train, 'predicting', backward=lambda predicting: not predicting).tooltip('Remove region')
+
+        self.ui.editor_region.set_visibility(selected is not None)
+        if selected is not None:
+            for field, value in zip(self.ui.numbers_region, np.reshape(regions[selected]['box'], (2, 3)).T.ravel()):
+                field.value = int(value)
+
+        boxes = [np.reshape(region['box'], (2, 3)) * self.slicer.voxel_sizes[0] for region in regions] if self.state.regions.predict and self.slicer.images is not None else []
+        self.ui.navigator.set_regions(boxes, selected)
+        self.scheduler.request('region_overlay')
+
+    def _region_size(self, box):
+        voxel = self.slicer.voxel_sizes[min(self.train.level, len(self.slicer.images) - 1)]
+        lo, hi = np.reshape(box, (2, 3)) * self.slicer.voxel_sizes[0]
+        dims = np.maximum(1, np.round((hi - lo) / voxel)).astype(int)
+        return f'{" × ".join(map(str, dims))} voxels'
+
+    def set_predict_target(self, regions):
+        self.state.regions.predict = regions
+        if not regions:
+            self.edit_regions(False)
+        self.ui.button_predict.set_text('Predict regions' if regions else 'Predict all volumes')
+        self.refresh_regions()
+
+    def edit_regions(self, edit):
+        if edit:
+            self.annot.mode = 'regions'
+        elif self.annot.mode == 'regions':
+            self.annot.mode = 'draw'
+
+    def add_region(self):
+        if self.slicer.images is None:
+            nicegui_ui.notify('Open a volume before adding a region.', type='warning')
+            return
+
+        voxel = self.slicer.voxel_sizes[min(self.train.level, len(self.slicer.images) - 1)]
+        block = np.round(self.train.input_size * voxel.min() / voxel)
+        lo = np.round(self.camera.origin / voxel - block / 2)
+        scale = voxel / self.slicer.voxel_sizes[0]
+
+        regions = self._regions()
+        regions.append({'box': region_box(lo * scale, (lo + block) * scale, self.slicer.shapes[0]), 'predict': True})
+        self.services.regions.save()
+        self.state.regions.selected = len(regions) - 1
+        self.refresh_regions()
+
+    def remove_region(self, i):
+        del self._regions()[i]
+        self.services.regions.save()
+        self.state.regions.selected = None
+        self.refresh_regions()
+
+    def select_region(self, i):
+        self.state.regions.selected = i
+        self.refresh_regions()
+
+    def set_region_predict(self, region, value):
+        region['predict'] = value
+        self.services.regions.save()
+        self.scheduler.request('region_overlay')
+
+    def go_to_region(self, i):
+        lo, hi = np.reshape(self._regions()[i]['box'], (2, 3)) * self.slicer.voxel_sizes[0]
+        size = np.abs(np.stack([self.camera.v, self.camera.w])) @ (hi - lo)
+        zoom = min(self.camera.max_zoom, 1.2 * float(np.max(size / self.nav.slice_shape)))
+        self.camera.set_view((lo + hi) / 2, zoom, self.camera.uvw)
+        self.select_region(i)
+        self._request_slice_update()
+
+    def update_region_box(self):
+        i = self.state.regions.selected
+        if i is None:
+            return
+
+        region = self._regions()[i]
+        current = np.reshape(region['box'], (2, 3)).T.ravel()
+        values = np.array([old if field.value is None else field.value for field, old in zip(self.ui.numbers_region, current)], float)
+        lo, hi = values.reshape(3, 2).T
+        region['box'] = region_box(lo, hi, self.slicer.shapes[0])
+        self.services.regions.save()
+        self.refresh_regions()
+
     def predict_volumes(self):
+        zarr_files, boxes = self.data.zarr_files, None
+        if self.state.regions.predict:
+            if self.data.active_zarr is None:
+                nicegui_ui.notify('Open a volume before predicting regions.', type='warning')
+                return
+            zarr_files = [self.data.active_zarr]
+            boxes = [region['box'] for region in self._regions() if region['predict']]
+            if not boxes:
+                nicegui_ui.notify('Add or check a region to predict.', type='warning')
+                return
+
         self._predict_cancel_event.clear()
         self.train.predicting = True
         self.ui.button_cancel_predict.set_enabled(True)
         self.ui.button_cancel_predict.set_text('Cancel')
-        self._show_predict_status(f'Preparing {len(self.data.zarr_files)} volume(s)...')
-        self.scheduler.request("predict_volumes")
+        self._show_predict_status(f'Preparing {len(zarr_files)} volume(s)...')
+        self.scheduler.request('predict_volumes', zarr_files, boxes)
 
     def cancel_predict_volumes(self):
         self._predict_cancel_event.set()
         self.ui.button_cancel_predict.set_enabled(False)
-        self.ui.button_cancel_predict.set_text('Cancelling...')
+        self.ui.button_cancel_predict.set_text('Canceling...')
 
     @on_view
-    def _show_predict_status(self, status, progress=0.0, chunks=''):
-        self.ui.label_predict_status.text = status
-        self.ui.progress_predict.value = progress
-        self.ui.label_predict_chunks.text = chunks
+    def _show_predict_status(self, status, progress=0.0):
+        self.ui.progress_live_train.value = progress
+        self.ui.label_live_train_status.text = status
 
     def _on_predict_progress(self, volume_name, vol_idx, num_volumes, block_idx, num_blocks, eta_seconds):
         self._show_predict_status(
-            f'Predicting {volume_name}... - ({vol_idx + 1}/{num_volumes})',
+            f'Volume {vol_idx + 1}/{num_volumes} · {block_idx}/{num_blocks} blocks · ETA {timedelta(seconds=round(eta_seconds))}',
             (block_idx / num_blocks) if num_blocks else 0.0,
-            f'{block_idx}/{num_blocks} blocks · ETA {timedelta(seconds=round(eta_seconds))}',
         )
 
-    def run_predict_volumes(self):
+    def run_predict_volumes(self, zarr_files, boxes):
         self.train.predicting = True
         live_prediction_visible = self.ui_state.prediction.visible
         self.ui_state.prediction.visible = False
 
         for job_name in ("live_train", "live_predict"):
             self.scheduler.jobs[job_name].cancel()
+        # Shown again, as an interrupted training burst reports its last step after the click
+        self._show_predict_status(f'Preparing {len(zarr_files)} volume(s)...')
 
-        cancelled_volume = None
+        canceled_volume = None
         try:
             self.trainer.predict_volumes(
-                self.data.zarr_files,
+                zarr_files,
                 Path(self.data.project_path),
+                boxes=boxes,
                 export_tiff=self.train.export_tiff,
                 progress_callback=self._on_predict_progress,
                 cancel_event=self._predict_cancel_event
             )
-        except predict.PredictionCancelled as e:
-            cancelled_volume = e.volume_name
+        except predict.PredictionCanceled as e:
+            canceled_volume = e.volume_name
         except Exception as e:
             self.notify(f'Prediction failed: {e}', type='negative')
             raise
         finally:
             self.train.predicting = False
             self.ui_state.prediction.visible = live_prediction_visible
+            self.show_live_train_hint('')
 
             if self.data.active_zarr is not None:
                 label_path = _prediction_label_path(self.data.project_path, self.data.active_zarr)
@@ -490,10 +625,12 @@ class CallbackManager:
             self.scheduler.request("live_predict")
             self._request_slice_update()
 
-        if cancelled_volume is not None:
-            self.notify(f'Prediction cancelled — removed partial output for {cancelled_volume}.')
+        if canceled_volume is not None and boxes is None:
+            self.notify(f'Prediction canceled — removed partial output for {canceled_volume}.')
+        elif canceled_volume is not None:
+            self.notify('Prediction canceled. Region blocks already written remain in the output.')
         elif self._predict_cancel_event.is_set():
-            self.notify('Prediction cancelled.')
+            self.notify('Prediction canceled.')
 
     def select_architecture(self):
         self.train.architecture = self.ui.select_architecture.value
@@ -504,9 +641,8 @@ class CallbackManager:
         self._rebuild_model_if_unlocked()
 
     def update_level(self):
-        self.train.level = int(self.ui.select_level.value)
-        self._refresh_level_options()
-        self._rebuild_model_if_unlocked()
+        self.train.changing_level = True
+        self.scheduler.request('change_level', int(self.ui.select_level.value))
 
     def _round_up_odd(self, value, lo, hi):
         value = min(max(math.ceil(value or lo), lo), hi)
@@ -531,12 +667,16 @@ class CallbackManager:
         self.ui.select_architecture.set_enabled(enabled)
         self.ui.select_encoder.set_enabled(enabled)
         self.ui.number_slab_size.set_enabled(enabled)
-        self.ui.select_level.set_enabled(enabled)
 
     @on_view
     def update_live_train_progress(self, step, total_steps, loss):
         self.ui.progress_live_train.value = (step / total_steps) if total_steps else 0.0
         self.ui.label_live_train_status.text = f'Step {step}/{total_steps} · loss {loss:.4f}'
+
+    @on_view
+    def update_replay_progress(self, level, replayed, total):
+        self.ui.progress_live_train.value = replayed / total
+        self.ui.label_live_train_status.text = f'Writing into level {level} · {replayed}/{total} strokes'
 
     @on_view
     def show_live_train_hint(self, text):

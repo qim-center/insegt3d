@@ -14,7 +14,7 @@ class MaskFillTool(BaseTool):
 
     async def on_pointer(self, e):
 
-        if not e.ctrl and self.annot.mode == 'mask_fill' and e.primary and e.down:
+        if not e.ctrl and self.annot.mode == 'mask_fill' and e.primary and e.down and not self.state.train.changing_level:
             self.scheduler.request("mask_fill", int(e.x), int(e.y))
 
     def _do_mask_fill(self, x, y):
@@ -29,7 +29,7 @@ class MaskFillTool(BaseTool):
         self.scheduler.request("write_mask", annotation)
 
     def _mask_fill(self, mask, center_x, center_y, color_idx):
-        """Fills the same-coloured region around the seed, or returns None if it reaches the border (not enclosed)."""
+        """Fills the same-colored region around the seed, or returns None if it reaches the border (not enclosed)."""
         label = np.uint8(color_idx + 1)
 
         seed_color = mask[center_y, center_x]

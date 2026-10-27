@@ -58,6 +58,16 @@ class JobScheduler:
         for job in self.jobs.values():
             job.shutdown()
 
+    async def drain(self) -> None:
+        while True:
+            tasks = [task for job in self.jobs.values() for task in (job._drain_task, job._idle_task) if task and not task.done()]
+            if not tasks:
+                await asyncio.sleep(0)
+                tasks = [task for job in self.jobs.values() for task in (job._drain_task, job._idle_task) if task and not task.done()]
+                if not tasks:
+                    return
+            await asyncio.gather(*tasks, return_exceptions=True)
+
 
 class Job:
     """

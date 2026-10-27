@@ -1,5 +1,6 @@
 import cv2
 import time
+import zlib
 import heapq
 import queue
 import shutil
@@ -11,7 +12,7 @@ import numpy as np
 import tensorstore as ts
 from pathlib import Path
 
-from insegt3d.volume.io import read_multiscale_zarr, read_multiscale_masks, make_ts_context, remap_labels, is_http_url, HTTP_REQUEST_CONCURRENCY
+from insegt3d.volume.io import read_multiscale_zarr, read_multiscale_masks, create_mask_levels, make_ts_context, remap_labels, is_http_url, HTTP_REQUEST_CONCURRENCY
 from insegt3d.volume.interp import write_nearest, read_nearest, read_trilinear
 from insegt3d.volume.intensity import coarsest_small_level, robust_percentile_range
 
@@ -19,7 +20,7 @@ _sample_pool = concurrent.futures.ThreadPoolExecutor(max_workers=8)
 
 class _RequestBudget:
     """
-    Remote chunk requests that may be outstanding at once, shared by every slicer. Cancelling a tensorstore read leaves
+    Remote chunk requests that may be outstanding at once, shared by every slicer. Canceling a tensorstore read leaves
     its HTTP requests queued, so requests only start within this limit, from queues that a newer view simply abandons.
     """
 
@@ -40,13 +41,13 @@ class _RequestBudget:
         with self._lock:
             self.used -= 1
 
-# Every request starts at once, so none waits in tensorstore's queue where it could not be cancelled
+# Every request starts at once, so none waits in tensorstore's queue where it could not be canceled
 _remote_requests = _RequestBudget(HTTP_REQUEST_CONCURRENCY)
 
 # Chunks already read from each remote level, which tensorstore now serves from its cache without a request
 _fetched_chunks = {}
 
-# Each finer level waits this many slice pixels behind the next coarser one, so a finer level's centre is requested
+# Each finer level waits this many slice pixels behind the next coarser one, so a finer level's center is requested
 # before a coarser level's edges
 _LEVEL_PRIORITY_PIXELS = 128
 
@@ -67,7 +68,7 @@ _RemoteLevel = collections.namedtuple('_RemoteLevel', 'volume chunk fetched rank
 
 class _ChunkRequests:
     """
-    The remote chunks one stream still needs, requested nearest the view centre first while the shared budget allows.
+    The remote chunks one stream still needs, requested nearest the view center first while the shared budget allows.
     A remote tile is read, from tensorstore's cache, once all its chunks have arrived, so the view refines chunk by chunk.
     """
 
@@ -127,7 +128,7 @@ class _ChunkRequests:
             self._arrive(*self._arrived.get())
 
     def _priority(self, level, key):
-        """Slice pixels from the view centre to the chunk's nearest point, plus `_LEVEL_PRIORITY_PIXELS` per source rank."""
+        """Slice pixels from the view center to the chunk's nearest point, plus `_LEVEL_PRIORITY_PIXELS` per source rank."""
         remote = self._levels[level]
         lo = remote.offset + np.asarray(key) * remote.chunk * remote.voxel_size
         nearest = np.clip(self._origin, lo, lo + remote.chunk * remote.voxel_size) - self._origin
@@ -203,7 +204,7 @@ class VolumeSlicer:
 
         self.shapes = np.array([image.shape for image in self.images], dtype=int)
 
-        # Masks are created on the first annotation (see set_data)
+        # Masks are created on the first annotation, from the working level down (see set_data)
         if mask_path is not None and Path(mask_path).exists():
             self.masks = self.read_masks()
         else:
@@ -230,7 +231,12 @@ class VolumeSlicer:
         return is_http_url(self.zarr_path)
 
     def read_masks(self):
-        return read_multiscale_masks(self.mask_path, [image.shape for image in self.images], self.scales, self.translations, ts_context=self.ts_context)
+        return read_multiscale_masks(self.mask_path, len(self.images), ts_context=self.ts_context)
+
+    @property
+    def mask_level(self):
+        """Finest level the masks are stored at."""
+        return next(level for level, mask in enumerate(self.masks) if mask is not None)
 
     def sources(self, levels, mask=False):
         volumes = self.masks if mask else self.images
@@ -295,10 +301,9 @@ class VolumeSlicer:
 
     @staticmethod
     def apply_patches(patches, undo):
-        for vol, box, index, before, after in (reversed(patches) if undo else patches):
-            sub = np.ascontiguousarray(vol[box])
-            sub.flat[index] = before if undo else after
-            vol[box] = sub
+        for vol, box, before, after in (reversed(patches) if undo else patches):
+            shape = tuple(s.stop - s.start for s in box)
+            vol[box] = np.frombuffer(zlib.decompress(before if undo else after), np.uint8).reshape(shape)
 
     def level(self, camera, zoom=None, level_modifier=0):
         zoom = camera.zoom if zoom is None else zoom
@@ -328,6 +333,7 @@ class VolumeSlicer:
         order=0,
         zoom_override=None,
         level=None,
+        min_level=0,
     ):
         """Samples `extent` (d0, d1, top, bottom, left, right in slice pixels) around the camera, as (D, H, W) or (H, W) if D == 1."""
 
@@ -337,6 +343,7 @@ class VolumeSlicer:
 
         zoom = zoom_override if zoom_override is not None else camera.zoom
         level = self.level(camera, zoom) if level is None else level
+        level = max(level, min(min_level, len(self.images) - 1))
 
         D = max(1, int(np.ceil(extent[1] - extent[0])))
         D, H, W = out_shape if len(out_shape) == 3 else (D, *out_shape)
@@ -350,7 +357,8 @@ class VolumeSlicer:
             level = _fitting_level(voxel_sizes, zoom, camera.u)
             sources = [(level, volumes[level], voxel_sizes[level], offsets[level])]
         else:
-            sources = self.sources([level], mask=mask)
+            # Views finer than the stored masks show the finest mask level enlarged
+            sources = self.sources([max(level, self.mask_level) if mask else level], mask=mask)
 
         for _ in self.stream(camera, output, sources, extent, zoom=zoom, order=order):
             pass
@@ -373,8 +381,8 @@ class VolumeSlicer:
     ):
         """
         Generator that fills `output` from `sources` tile by tile, yielding as reads complete.
-        Later sources take priority, and each source's tiles are read centre-first. Stops after
-        `deadline`. Local reads that are superseded or unfinished are cancelled below `keep_level`.
+        Later sources take priority, and each source's tiles are read center-first. Stops after
+        `deadline`. Local reads that are superseded or unfinished are canceled below `keep_level`.
         Remote tiles wait for their chunks (see _ChunkRequests), which only start while less than
         `budget_share` of the shared request budget is in use. Yields whether the remote tiles that
         were already cached at the start are all drawn.
@@ -530,7 +538,7 @@ class VolumeSlicer:
 
                 list(_sample_pool.map(draw, sorted(best.values(), key=lambda b: tiles[b[1]][0][1])))
 
-                # Drop reads that can no longer improve their tile, cancelling those below keep_level
+                # Drop reads that can no longer improve their tile, canceling those below keep_level
                 for i in [i for i in futures if superseded(i)]:
                     future = futures.pop(i)
                     undrawn_cached.discard(i)
@@ -546,13 +554,14 @@ class VolumeSlicer:
                 if isinstance(future, ts.Future) and (keep_level is None or tiles[i][2] < keep_level):
                     future.cancel()
 
-    def set_data(self, camera, data, extent, tile_hw=64, thickness=2):
-        """Writes the 2D `data` into every mask level and returns the changed voxels as undo patches."""
+    def set_data(self, camera, data, extent, levels, tile_hw=64, thickness=2):
+        """Writes the 2D `data` into the mask `levels`, creating any that are missing, and returns the changed blocks as undo patches."""
 
         if self.images is None:
             return []
 
-        if self.masks is None:
+        if self.masks is None or any(self.masks[level] is None for level in levels):
+            create_mask_levels(self.mask_path, levels, [image.shape for image in self.images], self.scales, self.translations)
             self.masks = self.read_masks()
 
         _, _, top, bottom, left, right = map(float, extent)
@@ -614,11 +623,11 @@ class VolumeSlicer:
 
                 write_nearest(sub, data0, (origin - mn).astype(np.float32), *grid)
 
-                changed = np.flatnonzero(sub != before)
-                if changed.size:
+                if not np.array_equal(sub, before):
                     vol[box] = sub
-                    patches.append((vol, box, changed, before.flat[changed], sub.flat[changed]))
+                    # Compressed, as a stroke drawn far zoomed out can change hundreds of millions of voxels
+                    patches.append((vol, box, zlib.compress(before, 1), zlib.compress(sub, 1)))
 
             return patches
 
-        return [patch for level in range(len(self.masks)) for patch in write_level(level)]
+        return [patch for level in levels for patch in write_level(level)]

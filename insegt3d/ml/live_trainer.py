@@ -4,6 +4,7 @@ import json
 import threading
 import numpy as np
 from pathlib import Path
+from functools import partial
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
@@ -31,6 +32,7 @@ class LiveTrainer:
 
         self.model_path = Path(self.state.data.project_path) / "model.ckpt"
         self.classes_path = Path(self.state.data.project_path) / "classes.json"
+        self.settings_path = Path(self.state.data.project_path) / "settings.json"
         self.model = None
         self._closed = False
         self._steps_done = 0
@@ -55,6 +57,9 @@ class LiveTrainer:
             print(f"Loaded existing model with {ts.num_classes} classes...")
             ts.model_locked = True
 
+        if self.settings_path.exists():
+            ts.level = int(json.loads(self.settings_path.read_text())['level'])
+
         self._model_lock = threading.Lock()
         self._snapshot_lock = threading.Lock()
         self.dataset = LiveTrainingDataset(self.services.tracker)
@@ -67,6 +72,7 @@ class LiveTrainer:
         self.scheduler.register_sync("live_predict", self._predict, max_hz=1)
         self.scheduler.register_sync("reset_model", self._reset_model, mode="drop", executor=gpu)
         self.scheduler.register_sync("change_classes", self._change_classes, mode="queue", executor=gpu)
+        self.scheduler.register_sync("change_level", self._change_level, mode="queue", executor=gpu)
         self.scheduler.register_sync("predict_volumes", self.callbacks.run_predict_volumes, mode="drop", executor=gpu)
 
         self._train_job = self.scheduler.jobs["live_train"]
@@ -114,7 +120,7 @@ class LiveTrainer:
 
     def _interrupted(self):
         ts = self.state.train
-        return self._closed or self.model is None or ts.predicting or ts.changing_classes or not ts.live_training_enabled or not ts.level_available
+        return self._closed or self.model is None or ts.predicting or ts.changing_classes or ts.changing_level or not ts.live_training_enabled or not ts.level_available
 
     def _report_progress(self, remaining):
         self.callbacks.update_live_train_progress(self._steps_done, self._steps_done + remaining, self._loss)
@@ -256,14 +262,48 @@ class LiveTrainer:
             ts.changing_classes = False
 
         self.callbacks.refresh_button_palette()
+        self.callbacks.refresh_regions()
         self.scheduler.request("live_train")
         self.scheduler.request("live_predict")
+
+    def _change_level(self, level):
+        ts = self.state.train
+        if level == ts.level:
+            ts.changing_level = False
+            return
+
+        # Training stops until the annotations are at the new level, then the model is tuned there counting from step zero
+        for job_name in ("live_train", "live_predict"):
+            self.scheduler.jobs[job_name].cancel()
+        self._steps_done = 0
+        self.callbacks.show_live_train_hint(f'Switching to level {level}…')
+
+        replaying = level < ts.level
+        try:
+            failed = self.services.history.change_level(level, Path(self.state.data.project_path) / 'masks', partial(self.callbacks.update_replay_progress, level))
+            self.settings_path.write_text(json.dumps({'level': level}))
+            if self.model_path.exists():
+                self._save()
+            self.dataset = LiveTrainingDataset(self.services.tracker)
+        finally:
+            ts.changing_level = False
+
+        for volume_path in failed:
+            self.callbacks.notify(f'Could not open {volume_path}. Its annotations will be written into level {level} when next annotated.')
+        self.callbacks.show_live_train_hint('')
+        if replaying:
+            self.callbacks.notify(f'Annotations written into level {level}.', type='positive')
+
+        self.callbacks.refresh_level()
+        self.scheduler.request('nav_overlays')
+        self.scheduler.request('live_train')
+        self.scheduler.request('live_predict')
 
     def _predict(self):
         s = self.state
         slicer = self.services.slicer
 
-        if self.model is None or slicer.images is None or s.train.predicting or s.train.changing_classes or not s.train.level_available or not s.ui.prediction.visible:
+        if self.model is None or slicer.images is None or s.train.predicting or s.train.changing_classes or s.train.changing_level or not s.train.level_available or not s.ui.prediction.visible:
             return
 
         camera = s.camera.copy()

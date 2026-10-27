@@ -2,6 +2,8 @@ import json
 import numpy as np
 from nicegui import ui
 
+from insegt3d.tools.regions import REGION_COLOR, SELECTED_COLOR
+
 EPS = 1e-9
 PI = np.pi
 
@@ -21,7 +23,7 @@ def basis_R(*columns):
 
 
 def frame_from_direction(d):
-    """Orthonormal frame whose local +y axis points along d (arrows are modelled along +y)."""
+    """Orthonormal frame whose local +y axis points along d (arrows are modeled along +y)."""
     d = unit(d)
     zref = np.array([0, 0, 1]) if abs(d @ [0, 0, 1]) < 0.99 else np.array([1, 0, 0])
     x = unit(np.cross(d, zref))
@@ -48,11 +50,12 @@ class NavigatorWidget:
         self.volume_center = None
         self.world_to_scene_scale = None
         self._wire_box = None
+        self._region_boxes = []
 
         self._last_plane_dims = None
         self._drag_pos = {}
 
-        with ui.scene(grid=False).classes('w-full') as self.scene:
+        with ui.scene(grid=False, background_color='#ececec').classes('w-full') as self.scene:
             self.scene.style("touch-action: none;")
 
             with self.scene.group() as self.gizmo:
@@ -82,6 +85,16 @@ class NavigatorWidget:
         ui.timer(0.1, self._enable_touch_orbit, once=True)
         ui.timer(0.1, self._install_gizmo_drag, once=True)
 
+    def set_theme(self, dark):
+        color = '#1b1a19' if dark else '#ececec'
+        ui.run_javascript(f"""
+        (function update() {{
+            const scene = getElement({self.scene.id});
+            if (scene?.renderer) scene.renderer.setClearColor('{color}');
+            else setTimeout(update, 100);
+        }})();
+        """)
+
     def initialize(self, volume_shape):
 
         self.volume_shape = np.asarray(volume_shape, float)
@@ -92,12 +105,25 @@ class NavigatorWidget:
             self._wire_box.delete()
             self._wire_box = None
 
-        size = (self.volume_shape * self.world_to_scene_scale).tolist()
         with self.scene:
-            self._wire_box = ui.scene.box(*size, wireframe=True).material("#aaaaaa")
+            self._wire_box = ui.scene.box(*self._scene_size(self.volume_shape), wireframe=True).material("#aaaaaa")
 
         self._last_plane_dims = None
         self.sync()
+
+    def set_regions(self, boxes, selected=None):
+        for box in self._region_boxes:
+            box.delete()
+        self._region_boxes = []
+
+        if self.volume_shape is None:
+            return
+
+        with self.scene:
+            for i, (lo, hi) in enumerate(boxes):
+                color = SELECTED_COLOR if i == selected else REGION_COLOR
+                box = ui.scene.box(*self._scene_size(hi - lo), wireframe=True).material(color).move(*self._to_scene((lo + hi) / 2))
+                self._region_boxes.append(box)
 
     def _enable_touch_orbit(self):
         ui.run_javascript(f"""
@@ -185,6 +211,9 @@ class NavigatorWidget:
         q = (np.asarray(p, float) - self.volume_center)
         q = self.W2S @ q
         return q * self.world_to_scene_scale
+
+    def _scene_size(self, size):
+        return (np.abs(self.W2S) @ np.asarray(size, float) * self.world_to_scene_scale).tolist()
 
     def _scene_axes(self):
         return tuple(self.W2S @ np.asarray(axis, float) for axis in self.camera.uvw)

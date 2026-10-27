@@ -22,7 +22,7 @@ class FloodFillTool(BaseTool):
 
     async def on_pointer(self, e):
 
-        if not e.ctrl and self.annot.mode == 'flood' and e.primary and e.down:
+        if not e.ctrl and self.annot.mode == 'flood' and e.primary and e.down and not self.state.train.changing_level:
             self.annot.annotating = True
 
         if self.annot.annotating and self.annot.mode == 'flood':

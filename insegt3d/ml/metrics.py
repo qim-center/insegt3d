@@ -7,7 +7,7 @@ EPSILON = 1e-12
 def scnp(logits, y_true, weight, neighborhood_size=3):
     """
     Same Class Neighbor Penalization: replaces each logit by the worst logit among its
-    same-class neighbours. `weight` limits this to fully annotated neighbourhoods.
+    same-class neighbors. `weight` limits this to fully annotated neighborhoods.
     See https://jmlipman.github.io/SCNP-SameClassNeighborPenalization/
     """
 

@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 import torch
 import torch.nn.functional as F
 
-from insegt3d.volume.io import get_scale_paths, read_multiscale_zarr, write_level0_array, add_multiscales, write_tiff_stack, normalize_zarr_path, volume_folder_name
+from insegt3d.volume.io import get_multiscale, get_scale_paths, read_multiscale_zarr, write_level0_array, add_multiscales, write_tiff_stack, normalize_zarr_path, volume_folder_name
 from insegt3d.volume.intensity import robust_percentile_range
 
 TEMP_CHUNK = 128
@@ -18,12 +18,11 @@ OUTPUT_CHUNKS = (64, 64, 64)
 OUTPUT_SHARDS = (256, 256, 256)
 
 
-class PredictionCancelled(Exception):
+class PredictionCanceled(Exception):
 
     def __init__(self, volume_name=None):
-        super().__init__(f"Prediction cancelled during volume: {volume_name}" if volume_name else "Prediction cancelled")
+        super().__init__(f"Prediction canceled during volume: {volume_name}" if volume_name else "Prediction canceled")
         self.volume_name = volume_name
-
 
 def predict_block(model, block, num_classes=2, batch_size=8, axes=(0,1,2)):
 
@@ -49,7 +48,7 @@ def predict_block(model, block, num_classes=2, batch_size=8, axes=(0,1,2)):
                 start, stop = max(0, i - slab_size // 2), min(input_size, i + batch_size + slab_size // 2)
                 slices = ((block_t[start:stop].to(device=device, dtype=torch.float32) - lo) / (hi - lo)).clamp_(0.0, 1.0)
 
-                # Each slice gets its slab_size neighbours as channels, clamped at the block edges
+                # Each slice gets its slab_size neighbors as channels, clamped at the block edges
                 idx = torch.arange(i, min(i + batch_size, input_size))[:, None] + offsets
                 batch = slices[(idx.clamp(0, input_size - 1) - start).to(device)]
 
@@ -67,7 +66,11 @@ def predict_block(model, block, num_classes=2, batch_size=8, axes=(0,1,2)):
 
     return block_prediction
 
-def predict_volume(zarr_file, prediction_file, temp_folder, model, batch_size, input_size=512, num_classes=2, level=0, overlap=0.25, axes=(0,1,2), tiff_folder=None, progress_callback=None, cancel_event=None):
+def predict_volume(zarr_file, prediction_file, temp_folder, model, batch_size, input_size=512, num_classes=2, level=0, overlap=0.25, axes=(0,1,2), tiff_folder=None, progress_callback=None, cancel_event=None, boxes=None):
+    """
+    Predicts the volume at `level`, or only inside `boxes` ([z0, y0, x0, z1, y1, x1] in full-resolution voxels). Boxes go
+    into the existing prediction if it is at this level and has these classes, and otherwise replace it.
+    """
 
     start_time = time.time()
 
@@ -81,9 +84,20 @@ def predict_volume(zarr_file, prediction_file, temp_folder, model, batch_size, i
     block_shape = tuple(int(n) for n in np.maximum(1, np.round(input_size * scales[level].min() / scales[level])))
     window = gaussian_3d(block_shape)
 
+    # The whole volume, or each box as (lo, hi) in voxels of this level, at least one voxel wide. Corners are rounded, as
+    # levels are often offset by part of a voxel and a box one block wide should stay one block wide
+    areas = [(np.zeros(3, int), input_volume_shape)]
+    if boxes is not None:
+        to_level = lambda corner: np.round((translations[0] + np.asarray(corner) * scales[0] - translations[level]) / scales[level])
+        areas = []
+        for box in boxes:
+            lo = np.clip(to_level(box[:3]), 0, input_volume_shape - 1).astype(int)
+            areas.append((lo, np.clip(np.maximum(to_level(box[3:]), lo + 1), 1, input_volume_shape).astype(int)))
+
     output_volume_shape = (num_classes,) + spatial_shape
 
     label_file = prediction_file / 'labels'
+    created_output = False
 
     temp_folder.mkdir(parents=True, exist_ok=True)
     scratch = Path(tempfile.mkdtemp(dir=temp_folder))
@@ -93,7 +107,12 @@ def predict_volume(zarr_file, prediction_file, temp_folder, model, batch_size, i
         pred_root, pred = write_level0_array(
             str(scratch / 'pred.zarr'), (num_classes + 1,) + spatial_shape, 'float16', (TEMP_CHUNK,) * 3)
 
-        block_coords, padded_block_coords, local_block_coords = get_block_coordinates(input_volume_shape, input_size=block_shape, overlap=overlap, align=TEMP_CHUNK)
+        # Each area is covered by its own blocks, shifted from the area into the volume
+        blocks = [get_block_coordinates(hi - lo, input_size=block_shape, overlap=overlap, align=TEMP_CHUNK) for lo, hi in areas]
+        offsets = [np.tile(lo, 2) for lo, _ in areas]
+        block_coords = np.concatenate([coords + offset for (coords, _, _), offset in zip(blocks, offsets)])
+        padded_block_coords = np.concatenate([padded + offset for (_, padded, _), offset in zip(blocks, offsets)])
+        local_block_coords = np.concatenate([local for _, _, local in blocks])
         num_blocks = len(padded_block_coords)
 
         print(f'\nSegmenting {zarr_name}...')
@@ -104,7 +123,7 @@ def predict_volume(zarr_file, prediction_file, temp_folder, model, batch_size, i
             for i in tqdm(range(num_blocks)):
 
                 if cancel_event is not None and cancel_event.is_set():
-                    raise PredictionCancelled(zarr_name)
+                    raise PredictionCanceled(zarr_name)
 
                 padded_block = next_block.result()
                 if i + 1 < num_blocks:
@@ -143,41 +162,63 @@ def predict_volume(zarr_file, prediction_file, temp_folder, model, batch_size, i
 
         print('Postprocessing predictions...')
 
-        prediction_file.mkdir(parents=True, exist_ok=True)
-        root, final_predictions = write_level0_array(
-            str(prediction_file), output_volume_shape, 'uint8',
-            OUTPUT_CHUNKS, OUTPUT_SHARDS)
-        label_root, final_labels = write_level0_array(
-            str(label_file), spatial_shape, 'uint8',
-            OUTPUT_CHUNKS, OUTPUT_SHARDS)
+        final_predictions = final_labels = None
+        if boxes is not None and (prediction_file / '0').is_dir() and (label_file / '0').is_dir():
+            try:
+                transforms = get_multiscale(prediction_file)['datasets'][0]['coordinateTransformations']
+                spatial = {t['type']: t[t['type']][-3:] for t in transforms}
+                if np.allclose(spatial['scale'], scales[level]) and np.allclose(spatial['translation'], translations[level]):
+                    final_predictions = zarr.open_array(str(prediction_file / '0'), mode='r+')
+                    final_labels = zarr.open_array(str(label_file / '0'), mode='r+')
+            except (KeyError, IndexError, ValueError):
+                pass
+
+        if final_predictions is None or final_predictions.shape != output_volume_shape or final_labels.shape != spatial_shape:
+            created_output = True
+            prediction_file.mkdir(parents=True, exist_ok=True)
+            _, final_predictions = write_level0_array(
+                str(prediction_file), output_volume_shape, 'uint8',
+                OUTPUT_CHUNKS, OUTPUT_SHARDS)
+            _, final_labels = write_level0_array(
+                str(label_file), spatial_shape, 'uint8',
+                OUTPUT_CHUNKS, OUTPUT_SHARDS)
 
         # Normalize by the accumulated weights and take the argmax, one shard at a time
         eps = 1e-3
-        for i0, j0, k0, i1, j1, k1 in get_shard_coordinates(input_volume_shape, shard_size=OUTPUT_SHARDS[0]):
-            if cancel_event is not None and cancel_event.is_set():
-                raise PredictionCancelled(zarr_name)
+        for area in areas:
+            for i0, j0, k0, i1, j1, k1 in get_shard_coordinates(input_volume_shape, shard_size=OUTPUT_SHARDS[0], box=area):
+                if cancel_event is not None and cancel_event.is_set():
+                    raise PredictionCanceled(zarr_name)
 
-            p = pred[:, i0:i1, j0:j1, k0:k1].astype('float32')
-            scores = 255 * p[:num_classes] / np.maximum(p[num_classes], eps)
-            final_predictions[:, i0:i1, j0:j1, k0:k1] = np.clip(np.rint(scores), 0, 255).astype('uint8')
-            final_labels[i0:i1, j0:j1, k0:k1] = (p[:num_classes].argmax(axis=0) + 1).astype('uint8')
+                p = pred[:, i0:i1, j0:j1, k0:k1].astype('float32')
+                scores = 255 * p[:num_classes] / np.maximum(p[num_classes], eps)
+                final_predictions[:, i0:i1, j0:j1, k0:k1] = np.clip(np.rint(scores), 0, 255).astype('uint8')
+                final_labels[i0:i1, j0:j1, k0:k1] = (p[:num_classes].argmax(axis=0) + 1).astype('uint8')
 
-        del pred, final_predictions, final_labels, root, pred_root, label_root
+        del pred, final_predictions, final_labels, pred_root
 
-        add_multiscales(str(prediction_file), scale=scales[level], translation=translations[level])
-        add_multiscales(str(label_file), scale=scales[level], translation=translations[level])
+        pyramid_boxes = None if boxes is None else areas
+        add_multiscales(str(prediction_file), scale=scales[level], translation=translations[level], boxes=pyramid_boxes)
+        add_multiscales(str(label_file), scale=scales[level], translation=translations[level], boxes=pyramid_boxes)
 
         if tiff_folder is not None:
             print('Writing tiff stack...')
             pred_level0 = get_scale_paths(prediction_file)[0]
-            write_tiff_stack(zarr.open(str(prediction_file), mode='r')[pred_level0], tiff_folder)
+            scores = zarr.open(str(prediction_file), mode='r')[pred_level0]
+            if boxes is None:
+                write_tiff_stack(scores, tiff_folder)
+            else:
+                # One stack per box, named by its voxels at this level
+                for lo, hi in areas:
+                    write_tiff_stack(scores, tiff_folder / '_'.join(f'{axis}{a}-{b}' for axis, a, b in zip('zyx', lo, hi)), box=(lo, hi))
 
     except BaseException:
-        # Remove the partial output, including on cancellation
-        if prediction_file.exists():
-            shutil.rmtree(prediction_file)
-        if tiff_folder is not None and tiff_folder.exists():
-            shutil.rmtree(tiff_folder)
+        # A whole-volume run replaces the prediction, so its partial output is removed, including on cancellation
+        if boxes is None or created_output:
+            if prediction_file.exists():
+                shutil.rmtree(prediction_file)
+            if tiff_folder is not None and tiff_folder.exists():
+                shutil.rmtree(tiff_folder)
         raise
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
@@ -188,7 +229,8 @@ def predict_volume(zarr_file, prediction_file, temp_folder, model, batch_size, i
     return batch_size
 
 
-def predict_all_volumes(zarr_files, model, level, predictions_dir, temp_dir, input_size=512, batch_size=None, overlap=0.25, axes=(0,1,2), export_tiff=False, progress_callback=None, cancel_event=None):
+def predict_all_volumes(zarr_files, model, level, predictions_dir, temp_dir, input_size=512, batch_size=None, overlap=0.25, axes=(0,1,2), export_tiff=False, progress_callback=None, cancel_event=None, boxes=None):
+    """Predicts each volume, or only inside `boxes` in each (see predict_volume)."""
 
     torch.set_float32_matmul_precision('medium')
     model.eval()
@@ -214,7 +256,7 @@ def predict_all_volumes(zarr_files, model, level, predictions_dir, temp_dir, inp
                 continue
 
             if cancel_event is not None and cancel_event.is_set():
-                raise PredictionCancelled()
+                raise PredictionCanceled()
 
             def volume_progress(block_idx, num_blocks, eta_seconds, vol_idx=vol_idx, name=zarr_name):
                 if progress_callback is not None:
@@ -231,6 +273,7 @@ def predict_all_volumes(zarr_files, model, level, predictions_dir, temp_dir, inp
                 level=level,
                 overlap=overlap,
                 axes=axes,
+                boxes=boxes,
                 tiff_folder=predictions_dir / f"{zarr_name.removesuffix('.zarr')}_tiff" if export_tiff else None,
                 progress_callback=volume_progress,
                 cancel_event=cancel_event
@@ -254,10 +297,12 @@ def get_padded_block(volume, i0, j0, k0, i1, j1, k1):
     padding = ((max(0, -i0), max(0, i1 - D)), (max(0, -j0), max(0, j1 - H)), (max(0, -k0), max(0, k1 - W)))
     return np.pad(block, padding, mode='reflect')
 
-def get_shard_coordinates(volume_shape, shard_size=128):
-    starts = [np.arange(0, s, shard_size) for s in volume_shape]
+def get_shard_coordinates(volume_shape, shard_size=128, box=None):
+    """Shard-aligned blocks covering the volume, or the part of it in `box` ((lo, hi) in voxels), cropped to it."""
+    lo, hi = (np.zeros(3, int), np.asarray(volume_shape)) if box is None else box
+    starts = [np.arange(a // shard_size * shard_size, b, shard_size) for a, b in zip(lo, hi)]
     chunk_coordinates = np.stack(np.meshgrid(*starts, indexing='ij'), -1).reshape(-1, 3)
-    chunk_coordinates = np.concatenate([chunk_coordinates,np.minimum(chunk_coordinates + shard_size, volume_shape)], axis=1)
+    chunk_coordinates = np.concatenate([np.maximum(chunk_coordinates, lo), np.minimum(chunk_coordinates + shard_size, hi)], axis=1)
     return chunk_coordinates
 
 def resample(array, shape, mode):
@@ -281,7 +326,7 @@ def gaussian_3d(shape, sigma=0.125, eps=1e-3):
 
 def get_block_coordinates(volume_shape, input_size=256, overlap=0.25, align=1):
     """
-    Overlapping blocks covering the volume, centred so the overshoot is split between both ends.
+    Overlapping blocks covering the volume, centered so the overshoot is split between both ends.
     Returns their bounds clipped to the volume, unclipped, and the clipped bounds relative to each block's start.
     """
 

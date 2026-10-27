@@ -9,6 +9,7 @@ from insegt3d.volume.camera import Camera
 from insegt3d.ml.annotation_tracker import AnnotationTracker
 from insegt3d.ml import metrics
 from insegt3d.app.history import EditHistory
+from insegt3d.app.regions import Regions
 
 
 @dataclass
@@ -65,7 +66,7 @@ class AnnotationState:
         self.colors, self.palette_rgb = colors, np.array([(0, 0, 0)] + rgb, dtype=np.uint8)
 
     def remove_color(self, i):
-        # Later classes keep their colours, and the removed colour moves to the end for reuse
+        # Later classes keep their colors, and the removed color moves to the end for reuse
         self.set_colors(self.colors[:i] + self.colors[i + 1:] + self.colors[i:i + 1])
         self.color_idx -= self.color_idx > i
 
@@ -93,7 +94,7 @@ class TrainState:
     lr: float = 1e-3
     batch_size: int = 4
     num_classes: int = 2
-    slab_size: int = 5  # Neighbouring slices fed to the model as channels ("2.5D depth")
+    slab_size: int = 5  # Neighboring slices fed to the model as channels ("2.5D depth")
     level: int = 0
     level_available: bool = True
     architecture: str = 'Unet'
@@ -105,8 +106,18 @@ class TrainState:
     model_locked: bool = False
     predicting: bool = False
     changing_classes: bool = False
+    changing_level: bool = False
     export_tiff: bool = False
     live_training_enabled: bool = True
+
+    @property
+    def busy(self):
+        return self.predicting or self.changing_level
+
+@dataclass
+class RegionState:
+    predict: bool = False
+    selected: Optional[int] = None
 
 @dataclass
 class AppState:
@@ -116,6 +127,7 @@ class AppState:
     annot: AnnotationState = field(default_factory=AnnotationState)
     data: DataState = field(default_factory=DataState)
     train: TrainState = field(default_factory=TrainState)
+    regions: RegionState = field(default_factory=RegionState)
 
 @dataclass
 class AppServices:
@@ -123,8 +135,10 @@ class AppServices:
     slicer: VolumeSlicer = field(init=False)
     tracker: AnnotationTracker = field(init=False)
     history: EditHistory = field(init=False)
+    regions: Regions = field(init=False)
 
     def __post_init__(self):
         self.slicer = VolumeSlicer(cache_size_mb=self.state.data.cache_size_mb)
         self.tracker = AnnotationTracker(str(self.state.data.project_path))
-        self.history = EditHistory(self.slicer, self.tracker)
+        self.history = EditHistory(self.slicer, self.tracker, self.state.train)
+        self.regions = Regions(self.state.data.project_path)

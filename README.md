@@ -1,26 +1,20 @@
 # InSegt3D
 
-Interactive Segmentation of 3D volumes.
+InSegt3D is a browser-based tool for segmenting large 3D volumes. You paint labels on 2D slices through the volume while a neural network trains on them in the background. Its prediction appears as an overlay, so you can see where the model is wrong and paint more where it needs help. When the result looks right, you apply the model to whole volumes.
 
-InSegt3D is a browser-based tool for annotating and segmenting large 3D volumetric images stored in OME-Zarr format. You annotate along 2D slices through the volume while a machine learning model trains live in the background on what you have annotated, and its prediction is shown back to you as an overlay while you keep annotating.
-
-The OME-Zarr format allows efficient and low-RAM annotation of large 3D volumes. Tested with up to 200GB OME-Zarr volumes on a laptop with 32GB RAM and an RTX A3000 GPU with 6GB VRAM.
-
----
+Volumes are read in chunks from multiscale OME-Zarr stores, so they never need to fit in memory. InSegt3D has been tested on 200 GB volumes using a laptop with 32 GB of RAM and a 6 GB RTX A3000 GPU.
 
 ## Requirements
 
-- Python **3.13**
-- A CUDA GPU or an Apple Silicon Mac is strongly recommended (training and prediction fall back to CPU, but will be VERY slow). Intel Macs are not supported. On a Mac the GPU shares the system memory, so lower `--cache_gb` to leave room for it
-- Data stored as multiscale OME-Zarr 0.5 (Zarr v3) - see [Preparing data](docs/preparing-data.md)
+- Python 3.13
+- A CUDA GPU or an Apple Silicon Mac. Without one, InSegt3D runs on the CPU, but training and prediction are very slow. Intel Macs are not supported.
+- Volumes stored as multiscale OME-Zarr 0.5 (Zarr v3). [Preparing data](docs/preparing-data.md) shows how to convert tiff files and numpy arrays.
 
 ## Installation
 
-Pick one of the options below. They all install the same package. The uv options require [uv](https://docs.astral.sh/uv/), which you can install by following its [installation guide](https://docs.astral.sh/uv/getting-started/installation/).
+The three options below install the same package. The uv options need [uv](https://docs.astral.sh/uv/getting-started/installation/).
 
 ### conda
-
-Create and activate a conda environment named `insegt3d`, then install the package:
 
 ```bash
 conda create --name insegt3d python=3.13
@@ -30,8 +24,6 @@ pip install git+https://github.com/qim-center/insegt3d
 
 ### uv virtual environment
 
-Create and activate a virtual environment in the current folder, then install the package:
-
 ```bash
 uv venv --python 3.13
 source .venv/bin/activate
@@ -40,235 +32,191 @@ uv pip install git+https://github.com/qim-center/insegt3d
 
 ### uv tool
 
-Install InSegt3D into its own isolated environment and put the `insegt3d` command on your PATH, so there is nothing to activate:
+This puts the `insegt3d` command on your PATH with its own environment, so there is nothing to activate.
 
 ```bash
 uv tool install --python 3.13 git+https://github.com/qim-center/insegt3d
 ```
 
-Update to the latest version with `uv tool upgrade insegt3d`, or remove it with `uv tool uninstall insegt3d`. If the `insegt3d` command is not found afterwards, run `uv tool update-shell` and restart your terminal.
+Update with `uv tool upgrade insegt3d` and remove with `uv tool uninstall insegt3d`. If the shell cannot find `insegt3d`, run `uv tool update-shell` and open a new terminal.
 
-## Quick start
+## Getting started
 
-Activate the environment you installed into (`conda activate insegt3d`, or `source .venv/bin/activate` from the folder where you created it). If you installed with `uv tool` there is nothing to activate. Then run:
+Activate the environment you installed into, then start InSegt3D.
 
 ```bash
 insegt3d
 ```
 
-This starts a server on a random free port and prints a link to open in any web browser. Enter a project folder path on the start page. An existing folder opens, and a new one is created. You can still pass `--project_folder "path/to/project_folder"` to open a project directly. To run InSegt3D on a remote machine or HPC cluster and use it from your own browser, see [Remote access](docs/remote-access.md).
+InSegt3D prints a link to open in your browser. The start page asks for a project folder, which holds your annotations, model and predictions. Enter an existing folder to reopen it, or a new path to create one. To run InSegt3D on a remote machine or cluster, see [Remote access](docs/remote-access.md).
 
-In the interface:
+A typical session goes like this.
 
-1. Put the path to your data in **Volume path or URL** and press **Open data**. This accepts a single `.zarr` store, a folder containing several `.zarr` stores, an `https` URL to a remote store, or a comma-separated list of such URLs. Plain `http` URLs are refused, see [Remote data](#remote-data).
-2. Pick a volume under **Current volume**.
-3. Navigate and begin annotating (see [Controls](#controls)). Once at least one annotation has been made for each class, a model will begin training in the background.
-4. Watch the **Live prediction overlay** improve as the model trains. Press <kbd>D</kbd> to toggle it on and off, or <kbd>Shift</kbd> + <kbd>Left Click</kbd> to accept part of the prediction as ground-truth annotation.
-5. When you are happy with the model, press **Predict all volumes**, then view the result with the **Prediction overlay**. The bar under the viewport shows the progress, and **Cancel** below the button stops the run. Tick **Also export TIFF stacks** first to write a tiff copy of each prediction alongside the zarr.
-
-To predict only part of the current volume, choose **Selected regions** under **Predict**. Add a region, check the areas to include, and use **Edit on slice** to move or resize them in a Z, Y or X view. You can also enter exact voxel bounds. Region prediction updates the selected areas and preserves compatible predictions elsewhere.
-If a region run is canceled, blocks already written inside its selected areas may remain in the prediction.
-
-The workspace starts in light mode. Use **Theme** in the top bar to switch between light and dark mode. Your choice is remembered in the browser. **Model settings** keeps training controls available without crowding the annotation workspace.
-Click the project name in the top bar to switch folders or shut down the app. In-progress work is finished before leaving, and a running prediction is canceled.
+1. Enter the location of your data in **Volume path or URL** and press **Open data**. This can be a `.zarr` store, a folder of `.zarr` stores, an https URL, or several https URLs separated by commas. Plain http URLs are refused for security reasons.
+2. Choose a volume in **Current volume**.
+3. Paint some voxels of each class. Training starts in the background once every class has an annotation, and the bar under the view shows its progress.
+4. Press <kbd>D</kbd> to show the live prediction. Paint more where it is wrong. Hold <kbd>Shift</kbd> and paint to accept the parts it gets right.
+5. When the live prediction looks good, press **Predict all volumes**. Turn on **Prediction overlay** to view the result.
 
 ### Command-line options
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `--project_folder` | start page | Open this project directly, bypassing the folder chooser |
-| `--port` | random | Port to serve the interface on |
-| `--host` | `localhost` | Address to serve on. Use `0.0.0.0` to allow access from other machines |
-| `--server_base_path` | none | URL prefix to serve under, e.g. behind a reverse proxy |
-| `--token` | none | Require this token to open the interface, see [Remote access](docs/remote-access.md#access-token). Can also be set with the `INSEGT3D_TOKEN` environment variable |
-| `--cache_gb` | `16` | Memory for cached volume data, in GiB. The app uses about 5 GiB on top of this, so lower it if the system starts swapping |
+| `--project_folder` | start page | Open this project folder directly |
+| `--port` | random free port | Port to serve the interface on |
+| `--host` | `localhost` | Address to serve on. Use `0.0.0.0` to accept connections from other machines |
+| `--server_base_path` | none | URL prefix to serve under, for use behind a reverse proxy |
+| `--token` | none | Require this token to open the interface. See [Access token](docs/remote-access.md#access-token) |
+| `--cache_gb` | `16` | Memory for cached volume data in GiB. InSegt3D uses about 5 GiB on top of this |
 
-Use `insegt3d --help` for the full list of options.
-
-## Preparing data
-
-InSegt3D reads multiscale [OME-Zarr 0.5](https://ngff.openmicroscopy.org/0.5/) stores.
-To convert a single tiff:
-
-```python
-from insegt3d.volume.io import convert_tiff_file
-
-convert_tiff_file('path/to/volume.tif', 'path/to/output.zarr')
-```
-
-See [docs/preparing-data.md](docs/preparing-data.md) for tiff folders, numpy arrays, 3D/4D/5D
-data, axis order, and converting volumes larger than RAM.
-
-### Remote data
-
-Remote stores must be served over `https://`. Plain `http://` URLs are refused, both in the
-interface and in batch prediction.
+Lower `--cache_gb` if the system starts swapping. On a Mac the GPU shares system memory, so leave extra room there.
 
 ## Controls
 
-### Annotating
-
 | Input | Action |
 | --- | --- |
-| Left Click + Drag | Paint with the selected class |
-| Right Click + Drag | Erase (also the eraser end of a tablet pen) |
-| Shift + Left Click | Push the displayed prediction overlay into the annotation map |
-| Mouse Wheel | Adjust brush size |
-| B / E / G / F / K | Draw / Erase / Fill / Flood / Keep tool |
-| C | Next class color |
-| 1–9, 0 | Select class 1–10 |
+| Left drag | Use the selected annotation tool |
+| Right drag, or the eraser end of a pen | Erase |
+| Shift + left drag | Keep the live prediction under the stroke |
+| Mouse wheel | Change the brush size |
+| B, E, G, F, K | Draw, Erase, Fill, Flood or Keep tool |
+| 1 to 9, 0 | Select class 1 to 10 |
+| C | Select the next class |
 | D | Toggle the live prediction overlay |
-| Ctrl + Z | Undo last stroke |
-| Ctrl + Y | Redo last stroke |
-
-### Navigating
-
-| Input | Action |
-| --- | --- |
-| Ctrl + Left Click + Drag | Pan |
-| Ctrl + Double Click | Center the view on the clicked point |
-| Ctrl + Right Click + Drag | Scroll through slices |
-| Q / A | Step one slice up / down along the view normal |
-| Ctrl + Middle Click + Drag | Rotate the slicing plane |
-| Ctrl + Mouse Wheel | Zoom in and out |
-| Space | Randomize the orientation of the slicing plane |
-| Z / Y / X | View along the z, y or x axis, keeping the position and zoom |
+| Ctrl + Z, Ctrl + Y | Undo or redo a stroke |
+| Ctrl + left drag | Pan |
+| Ctrl + right drag | Move through slices |
+| Ctrl + middle drag | Rotate the slicing plane |
+| Ctrl + mouse wheel | Zoom |
+| Ctrl + double-click | Center the view on a point |
+| Q, A | Step one slice forward or back |
+| Z, Y, X | View along the z, y or x axis |
+| Space | Pick a random slice orientation |
+| Comma, period | Go to the previous or next annotated slice |
 | H | Toggle the crosshair |
-| , / . | Go to the previous / next annotated slice |
 
-Touch input is supported as well: one finger pans, two fingers rotate and pinch-zoom.
+On a touch screen, one finger pans and two fingers rotate and zoom. Shortcuts pause while you type in a text field. Press Enter or Esc, or click the slice view, to resume them. **Shortcuts** in the top bar lists them all.
 
-Shortcuts are paused while typing in a text or number field. Press Enter or Esc, or click the
-viewport, to return to them. **Shortcuts** in the top bar lists every shortcut.
+## The workspace
 
-The **Navigate** panel shows the slicing plane inside the volume's bounding box. Drag its arrows
-to move the plane, or the spheres on its rings to rotate it. Below it, **Z**, **Y** and **X** align
-the view to an axis, **Center view** returns to the starting view, and **Go to…** moves to a typed
-location (in full-resolution voxels) and slice normal. The arrows beside **Annotated slices** step
-through the slices you have annotated in the current volume, framing their strokes and turning on
-the annotation overlay.
+The left panel holds **Data source**, **Annotate** and **Predict**. The right panel holds **Navigate** and **Display**. On narrow screens the panels fold away, and **Tools** and **View** in the top bar bring them back.
+
+The project name in the top bar lets you switch projects or shut down InSegt3D. Work in progress is saved first, and a running prediction is canceled. **Theme** switches between light and dark mode.
+
+### Annotation tools
+
+| Tool | What it does |
+| --- | --- |
+| Draw | Paints the selected class with a round brush |
+| Erase | Removes annotations of any class |
+| Fill | Fills an area enclosed by existing annotations with the selected class |
+| Flood | Grows a fill from where you click based on intensity. Drag further to raise the tolerance |
+| Keep | Copies the live prediction under the brush into the annotations |
+
+Right drag erases in Draw, Erase and Keep. Holding Shift switches to Keep until you let go.
 
 ### Classes
 
-Projects start with two classes. Press **+** beside **Class** to add one (up to ten), or **−** to
-remove the selected class. Removing a class erases its annotations and renumbers the
-classes after it, which keep their colors. Classes can be changed at any time: the model keeps
-what it has learned, and training resumes once every class has an annotation.
-
-### Annotation modes
-
-The tool buttons at the top of the **Annotate** panel switch between five ways of painting
-(hover over them for their shortcuts):
-
-- **Draw** - freehand brush strokes in the selected class.
-- **Erase** - brush strokes clear annotations of any class. In Draw, Erase and Keep mode,
-  right-click dragging or the eraser end of a tablet pen erases too.
-- **Fill** - click inside a region fully enclosed by existing annotations to fill it.
-- **Flood** - click a seed point and drag to grow an intensity-based flood fill. The drag
-  distance sets the tolerance.
-- **Keep** - brush strokes keep the live prediction inside them as annotation
-  (the same thing Shift does temporarily while held).
+A project starts with two classes and can have up to ten. Use the plus and minus buttons beside **Class** to add a class or remove the selected one. Removing a class erases its annotations and renumbers the classes after it, which keep their colors. Existing predictions keep the old classes. The model keeps what it has learned through these changes and resumes training once every class has an annotation.
 
 ### Working resolution
 
-Choose **Working resolution** in the **Data source** panel. This pyramid level determines where
-annotations are stored and where the model trains and predicts. A coarser level is faster for large
-volumes. Masks are stored at the selected level and every coarser level, and zooming in beyond it
-shows the selected level enlarged.
+**Working resolution** in **Data source** picks the pyramid level used for annotating, training and predicting. A coarser level is faster on large volumes. Zooming in past the working level shows that level enlarged.
 
-You can change the level after annotating. Moving to a finer level replays strokes into the newly
-needed mask levels. Draw and Erase strokes are redrawn at the finer resolution, so they stay sharp,
-while Fill, Flood and Keep strokes keep the resolution they were made at. Live training stops while
-the level changes, and its bar reads **Updating annotations** and shows the progress instead. Annotating, opening data and switching
-volumes wait until it finishes. The model keeps what it has learned and then trains one burst at the
-new level, with its step count starting from zero.
-Moving to a coarser level keeps the finer masks, so returning to them preserves your work. The
-selection is saved with the project.
+You can change the level at any time and the model keeps what it has learned. Moving to a finer level redraws your Draw and Erase strokes at the new resolution so they stay sharp. Fill, Flood and Keep strokes keep the resolution they were made at. Training and annotating pause until the update finishes, and the bar under the view shows its progress. Moving to a coarser level keeps your finer annotations, so moving back loses nothing.
 
-### Prediction regions
+### Navigate panel
 
-In **Predict**, choose **Selected regions** to process areas of the current volume. **Add region**
-creates a block around the current view. Check the regions to include, select one to enter exact
-bounds in full-resolution voxels, or use **Edit on slice** to drag its edges in a Z, Y or X view.
-The list shows each region's size at the working resolution. A region run updates matching parts
-of an existing prediction when its resolution and classes are compatible.
+The 3D view shows the slicing plane inside the volume. Drag its arrows to move the plane, or the spheres on its rings to rotate it. Below it are buttons to view along each axis, **Center view** to return to the starting view, and **Go to…** to jump to a location in full-resolution voxels. The arrows beside **Annotated slices** step through the slices you have annotated in the current volume.
 
 ### Display
 
-The **Display** panel toggles three overlays and sets their opacity: the **Annotation overlay**,
-the **Prediction overlay** (the result of **Predict all volumes**, once the current volume has one) and the
-**Live prediction overlay**. The **Crosshair** marks the center of the view, which rotating,
-zooming and **Z** / **Y** / **X** keep in place, so Ctrl + double-click an object to center it and
-then view it along each axis. Drag the range under the histogram to set the intensity window. It
-starts at the 0.5th to 99.5th percentile of the whole volume at low resolution and its center at full
-resolution.
+**Display** has three overlays, each with an opacity slider.
 
-## Training
+- **Annotation overlay** shows your annotations.
+- **Live prediction overlay** shows what the model currently predicts for the slice.
+- **Prediction overlay** shows the saved result of the last prediction run on this volume.
 
-Live training runs in the background while you annotate and is on by default. Under
-**Model settings** you can turn it off, pick a different architecture or encoder (any
-combination supported by
-[segmentation-models-pytorch](https://github.com/qubvel-org/segmentation_models.pytorch)),
-set the **2.5D depth** (how many neighboring slices the model sees), choose the loss function,
-toggle SCNP, change the learning rate, batch size and steps per training burst, or reset the
-model and the annotations. Choose the level it trains and predicts at using
-[Working resolution](#working-resolution).
+**Crosshair** marks the center of the view. Rotating, zooming and the axis views all keep this point fixed, so you can Ctrl + double-click an object to center it and then look at it along each axis.
 
-The architecture, encoder and 2.5D depth are locked once training has started. Use **Reset
-model** to change them. The working resolution can be changed at any time.
+Drag the range under the histogram to set the intensity window. It starts at the 0.5th to 99.5th percentile of the volume's intensities.
+
+### Predicting
+
+**Prediction area** in **Predict** chooses what to predict. **All volumes** runs the model on every opened volume. **Selected regions** runs it only inside boxes you place in the current volume. The bar under the view shows the progress, and **Cancel** stops the run. Tick **Also export TIFF stacks** to also write each prediction as tiff files.
+
+To set up a region, press **Add** to place a box around the current view. Turn on **Edit on slice** and use a Z, Y or X view to drag the box or its edges. You can also select a region and type its bounds in full-resolution voxels. Only checked regions are predicted.
+
+A region run updates the existing prediction inside its boxes and leaves the rest in place. If that prediction was made at another working resolution or with a different number of classes, a new prediction covering only the regions replaces it. Canceling a region run can leave some finished blocks behind in the prediction.
+
+### Model settings
+
+**Model settings** in the top bar controls training.
+
+| Setting | Default | Description |
+| --- | --- | --- |
+| Model architecture | Unet | Any architecture in [segmentation-models-pytorch](https://github.com/qubvel-org/segmentation_models.pytorch) |
+| Model encoder | efficientnet-b3 | Any encoder in segmentation-models-pytorch |
+| 2.5D depth | 5 | Number of consecutive slices the model sees at once |
+| Loss function | Dice+CE | Training loss |
+| SCNP | on, size 3 | Adds [Same Class Neighbor Penalization](https://jmlipman.github.io/SCNP-SameClassNeighborPenalization/) to the loss |
+| Learning rate | 0.001 | Optimizer step size |
+| Batch size | 4 | Slices per training step |
+| Steps per training burst | 20 | Training steps between checkpoint saves and live prediction updates |
+| Live training | on | Train in the background while you annotate |
+
+The architecture, encoder and 2.5D depth lock once training starts. **Reset model** discards the model so you can change them. **Reset annotations** deletes every annotation in the project.
 
 ## Batch prediction
 
-Predictions can also be run headlessly from a trained checkpoint, which is useful for
-applying a model to a whole set of volumes on a cluster:
+`insegt3d predict` applies a trained model without the interface. This is useful for processing many volumes on a cluster.
 
 ```bash
 insegt3d predict \
-    --checkpoint "path/to/project_folder/model.ckpt" \
-    --data "path/to/zarrs" \
-    --output "path/to/output"
+    --checkpoint path/to/project_folder/model.ckpt \
+    --data path/to/volumes \
+    --output path/to/output
 ```
-
-`--data` accepts a single Zarr store, a folder of Zarr stores, or an `https` URL.
-Results are written to `<output>/predictions/<volume_name>__<id>.zarr`, where `<id>` is a short hash of the volume's location.
-Each result is a zarr of per-class scores (`uint8`, 0-255) with the predicted class labels in a nested `labels` zarr.
-Prediction runs at the resolution the model was trained on. Volumes without that level are skipped and listed in
-`<output>/predictions/skipped_volumes.txt`.
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `--checkpoint` | *required* | Trained checkpoint (`model.ckpt`) |
-| `--data` | *required* | Volume, folder of volumes, or `https` URL |
-| `--output` | *required* | Output directory |
-| `--input-size` | `512` | Cubic block size used for inference |
-| `--batch-size` | auto | Inference batch size. Defaults to the largest that fits in memory |
-| `--overlap` | `0.25` | Fractional overlap between adjacent blocks |
-| `--axes` | `0,1,2` | Axes to predict along and average over |
-| `--export-tiff` | off | Also write each prediction as a tiff stack |
-| `--temp-dir` | `<output>/temp` | Scratch directory for accumulation buffers |
+| `--checkpoint` | required | Trained model, usually `model.ckpt` in a project folder |
+| `--data` | required | A `.zarr` store, a folder of `.zarr` stores, or https URLs separated by commas |
+| `--output` | required | Output folder |
+| `--input-size` | `512` | Edge length of the cubic blocks the volume is split into |
+| `--batch-size` | largest that fits | Slices per inference batch |
+| `--overlap` | `0.25` | Overlap between neighboring blocks, as a fraction of the block size |
+| `--axes` | `0,1,2` | Axes to slice along. The predictions along each axis are averaged |
+| `--export-tiff` | off | Also write each prediction as tiff files |
+| `--temp-dir` | `<output>/temp` | Folder for temporary files |
 
-Run `insegt3d predict --help` for the same list from the terminal.
+Prediction runs at the working resolution the model was trained at. Volumes without that level are skipped and listed in `skipped_volumes.txt` in the predictions folder.
 
-### Exporting to tiff
+### Output
 
-Both **Also export tiff stack** in the interface and `--export-tiff` on the command line
-write a second copy of the prediction next to the zarr, as
-`<output>/predictions/<volume_name>__<id>_tiff/`. The folder holds one tiff per z slice, each
-a channel-last `(y, x, c)` image whose channels are the per-class scores - the same data
-the zarr holds.
+Each volume's prediction goes to `predictions/<name>__<id>.zarr` in the output folder, where `<id>` is a short hash of the volume's location. The hash keeps volumes with the same name apart. The store holds a score from 0 to 255 for each class and voxel. A `labels` store inside it holds the predicted class of each voxel, numbered from 1.
 
-## Project folder layout
+The tiff export writes to `predictions/<name>__<id>_tiff/`, with one file per z slice. Each file holds the class scores as channels in `(y, x, c)` order. A region run writes one subfolder per region inside it instead, named after the region's bounds.
+
+The interface uses the same layout inside the project folder.
+
+## Project folder
 
 ```
 project_folder/
-├── annotations.json     # annotated strokes and their camera poses
-├── classes.json         # class colors, in class order
-├── regions.json         # prediction regions for each volume
-├── settings.json        # working resolution
-├── model.ckpt           # latest trained model checkpoint
-├── masks/               # per-volume annotation masks from the working level down (zarr)
-├── predictions/         # volume predictions (zarr, plus optional tiff stacks)
-└── temp/                # scratch space used during prediction
+├── annotations.json   # annotation strokes and the view each was drawn in
+├── classes.json       # class colors in class order
+├── regions.json       # prediction regions for each volume
+├── settings.json      # working resolution
+├── model.ckpt         # latest model checkpoint
+├── masks/             # annotation masks for each volume
+├── predictions/       # predictions for each volume
+└── temp/              # temporary files used during prediction
 ```
 
-A project folder can be reopened at any time. The annotations, masks and the trained model are all picked up again on start-up.
+Reopen a project folder to continue where you left off.
+
+## Further reading
+
+- [Preparing data](docs/preparing-data.md) covers converting tiff files and numpy arrays, axis order and voxel size.
+- [Remote access](docs/remote-access.md) covers running InSegt3D on a workstation or cluster and using it from your own browser.

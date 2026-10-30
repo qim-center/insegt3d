@@ -11,7 +11,6 @@ import torch
 import torch.nn.functional as F
 
 from insegt3d.volume.io import get_multiscale, get_scale_paths, read_multiscale_zarr, write_level0_array, add_multiscales, write_tiff_stack, normalize_zarr_path, volume_folder_name
-from insegt3d.volume.intensity import robust_percentile_range
 
 TEMP_CHUNK = 128
 OUTPUT_CHUNKS = (64, 64, 64)
@@ -32,7 +31,6 @@ def predict_block(model, block, num_classes=2, batch_size=8, axes=(0,1,2)):
     slab_size = model.num_channels
 
     offsets = torch.arange(slab_size) - slab_size // 2
-    lo, hi = robust_percentile_range(block)
 
     block = torch.from_numpy(block.astype(np.float32, copy=False))
     block_prediction = np.zeros((num_classes, input_size, input_size, input_size), dtype=np.float32)
@@ -46,11 +44,11 @@ def predict_block(model, block, num_classes=2, batch_size=8, axes=(0,1,2)):
             for i in range(0, input_size, batch_size):
 
                 start, stop = max(0, i - slab_size // 2), min(input_size, i + batch_size + slab_size // 2)
-                slices = ((block_t[start:stop].to(device=device, dtype=torch.float32) - lo) / (hi - lo)).clamp_(0.0, 1.0)
+                slices = block_t[start:stop].to(device=device, dtype=torch.float32)
 
                 # Each slice gets its slab_size neighbors as channels, clamped at the block edges
                 idx = torch.arange(i, min(i + batch_size, input_size))[:, None] + offsets
-                batch = slices[(idx.clamp(0, input_size - 1) - start).to(device)]
+                batch = normalize_slabs(slices[(idx.clamp(0, input_size - 1) - start).to(device)])
 
                 batch_prediction = model(batch).float().cpu().numpy()
 
@@ -304,6 +302,13 @@ def get_shard_coordinates(volume_shape, shard_size=128, box=None):
     chunk_coordinates = np.stack(np.meshgrid(*starts, indexing='ij'), -1).reshape(-1, 3)
     chunk_coordinates = np.concatenate([np.maximum(chunk_coordinates, lo), np.minimum(chunk_coordinates + shard_size, hi)], axis=1)
     return chunk_coordinates
+
+def normalize_slabs(batch):
+    """robust_normalize applied to each slab of a (B, slab_size, H, W) batch."""
+    batch.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
+    sample = batch[:, ::4, ::4, ::4].flatten(1)
+    lo, hi = torch.quantile(sample, batch.new_tensor([0.005, 0.995]), dim=1).view(2, -1, 1, 1, 1)
+    return batch.sub_(lo).div_(torch.where(hi > lo, hi - lo, 1e-6)).clamp_(0.0, 1.0)
 
 def resample(array, shape, mode):
     if array.shape[-3:] == tuple(shape):

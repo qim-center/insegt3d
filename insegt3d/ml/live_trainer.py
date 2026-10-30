@@ -144,6 +144,10 @@ class LiveTrainer:
             self.callbacks.show_live_train_hint(f'Annotate class {unlabeled[0]} to train')
             return
 
+        # The first step of a session opens the volumes and warms up the GPU, which can take several seconds
+        if self._loss is None:
+            self.callbacks.show_live_train_hint('Starting training…')
+
         if not ts.model_locked:
             ts.model_locked = True
             self.callbacks.set_model_lock()

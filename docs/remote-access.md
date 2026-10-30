@@ -1,69 +1,64 @@
 # Remote access
 
-InSegt3D runs as a web server, so it can run on a remote machine with a GPU, such as a workstation or an HPC compute node, while you use it from the browser on your own computer. An SSH tunnel connects a port on your computer to the InSegt3D server.
+InSegt3D runs as a web server, so it can run on a remote machine with a GPU while you work in the browser on your own computer. An SSH tunnel connects a port on your computer to InSegt3D on the remote machine.
 
-## Remote machine you can SSH into directly
+The examples use port 8080. Any free port works. Without `--port`, InSegt3D picks a free port and prints it at startup.
 
-1. SSH into the machine and start InSegt3D:
+## A machine you can SSH into
 
-   ```bash
-   insegt3d --project_folder "path/to/project_folder"
-   ```
-
-2. Note the port in the address InSegt3D prints when it starts. For example, `NiceGUI ready to go on http://localhost:37788` means port `37788`.
-
-3. On your own computer, open a tunnel:
+1. On the remote machine, start InSegt3D.
 
    ```bash
-   ssh -N -L {local_port}:localhost:{insegt3d_port} {username}@{server}
+   insegt3d --project_folder path/to/project_folder --port 8080
    ```
 
-4. Open `http://localhost:{local_port}` in your browser.
-
-## HPC compute node behind a login node
-
-On most clusters you SSH into a login node, while InSegt3D runs on a compute node that only the login node can reach.
-
-1. Start a session on a compute node through your cluster's scheduler, preferably one with a GPU. Start InSegt3D there with `--host 0.0.0.0`, so the login node can reach it:
+2. On your own computer, open a tunnel.
 
    ```bash
-   insegt3d --project_folder "path/to/project_folder" --host 0.0.0.0
+   ssh -N -L 8080:localhost:8080 username@server
    ```
 
-2. Note the name of the compute node (run `hostname` on it) and the port InSegt3D prints when it starts.
+   The first 8080 is the port on your computer and the second is the port InSegt3D uses.
 
-3. On your own computer, open a tunnel through the login node:
+3. Open `http://localhost:8080` in your browser.
+
+## A cluster compute node
+
+On most clusters you log in to a login node, and jobs run on compute nodes that only the login node can reach.
+
+1. Start an interactive job on a compute node, ideally one with a GPU. Start InSegt3D there with `--host 0.0.0.0` so the login node can connect to it. Set a token as well, because anyone on the cluster network can reach the node.
 
    ```bash
-   ssh -N -L {local_port}:{compute_node}:{insegt3d_port} {username}@{login_node}
+   export INSEGT3D_TOKEN=choose-a-long-random-string
+   insegt3d --project_folder path/to/project_folder --port 8080 --host 0.0.0.0
    ```
 
-   For example, `ssh -N -L 8080:node042:37788 jeff@login.cluster.example.org`.
+2. Run `hostname` on the compute node to get its name.
 
-4. Open `http://localhost:{local_port}` in your browser.
+3. On your own computer, open a tunnel through the login node to the compute node.
 
-With `--host 0.0.0.0` anyone who can reach the compute node on the cluster network can open InSegt3D, so protect it with a token as described below. Stop InSegt3D when you are done.
+   ```bash
+   ssh -N -L 8080:node042:8080 username@login.cluster.example.org
+   ```
+
+4. Open `http://localhost:8080/?token=choose-a-long-random-string` in your browser.
+
+Stop InSegt3D when you are done so the port does not stay open.
 
 ## Access token
 
-By default InSegt3D asks for no login. Start it with `--token` to require a token, as Jupyter does:
+Without a token, InSegt3D accepts every connection. Set one with `--token` or with the `INSEGT3D_TOKEN` environment variable. Other users on a shared machine can see command-line arguments, so prefer the environment variable there.
 
-```bash
-insegt3d --project_folder "path/to/project_folder" --token "choose-a-long-random-string"
-```
+A browser or other client can supply the token in three ways.
 
-Command-line arguments are visible to other users on the machine, so on a shared system set the `INSEGT3D_TOKEN` environment variable instead.
+- Add `?token=` and the token to the address. InSegt3D stores it in a cookie and removes it from the address.
+- Enter it on the login page that appears when no token is given. The cookie remembers it, so you enter it once per browser.
+- Send an `Authorization` header with the value `token` or `Bearer` followed by the token. This suits scripts.
 
-A client then provides the token in one of three ways:
-
-- In the address, as in `http://localhost:8080/?token=choose-a-long-random-string`. The browser stores the token in a cookie and removes it from the address.
-- In an `Authorization: token choose-a-long-random-string` header (`Authorization: Bearer ...` works too).
-- On the login page InSegt3D shows when neither is given. The token is stored in a cookie, so you only enter it once per browser.
-
-The token travels unencrypted unless the connection is encrypted, as it is through an SSH tunnel.
+The token is sent as plain text unless the connection is encrypted. An SSH tunnel encrypts the connection between your computer and the remote machine.
 
 ## Tips
 
-- `{local_port}` can be any free port on your computer, for example `8080`.
-- `ssh -N` keeps the tunnel open until you press <kbd>Ctrl</kbd>+<kbd>C</kbd>. Add `-f` to run it in the background instead.
-- Use `--port` to choose a fixed InSegt3D port instead of reading it from the output each time.
+- `ssh -N` holds the tunnel open until you press <kbd>Ctrl</kbd> + <kbd>C</kbd>. Add `-f` to run it in the background.
+- The two ports in `-L` do not need to match. If 8080 is taken on your computer, use another port there and open that one in your browser.
+- `--server_base_path` serves InSegt3D under a URL prefix, for use behind a reverse proxy.
